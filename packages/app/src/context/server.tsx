@@ -5,8 +5,17 @@ import { usePlatform } from "@/context/platform"
 import { Persist, persisted } from "@/utils/persist"
 import { checkServerHealth } from "@/utils/server-health"
 
+/** Stored project information with worktree path and expanded state */
 type StoredProject = { worktree: string; expanded: boolean }
 
+/**
+ * Normalize and validate a server URL
+ * - Trims whitespace
+ * - Adds http:// protocol if missing
+ * - Removes trailing slashes
+ * @param input - Raw URL string
+ * @returns Normalized URL or undefined if invalid
+ */
 export function normalizeServerUrl(input: string) {
   const trimmed = input.trim()
   if (!trimmed) return
@@ -14,11 +23,25 @@ export function normalizeServerUrl(input: string) {
   return withProtocol.replace(/\/+$/, "")
 }
 
+/**
+ * Get a display name for a server URL
+ * - Removes protocol prefix
+ * - Removes trailing slashes
+ * @param url - Server URL
+ * @returns Display name (e.g., "localhost:4096" from "http://localhost:4096/")
+ */
 export function serverDisplayName(url: string) {
   if (!url) return ""
   return url.replace(/^https?:\/\//, "").replace(/\/+$/, "")
 }
 
+/**
+ * Generate a storage key for projects associated with a server URL
+ * - Local servers use "local" key
+ * - Remote servers use full URL as key
+ * @param url - Server URL
+ * @returns Storage key for projects
+ */
 function projectsKey(url: string) {
   if (!url) return ""
   const host = url.replace(/^https?:\/\//, "").split(":")[0]
@@ -26,37 +49,63 @@ function projectsKey(url: string) {
   return url
 }
 
+/**
+ * Server context for managing OpenCode server connections
+ * Provides server list management, health checking, and project tracking
+ */
 export const { use: useServer, provider: ServerProvider } = createSimpleContext({
   name: "Server",
   init: (props: { defaultUrl: string }) => {
     const platform = usePlatform()
 
+    // Create persisted store for server list and projects
     const [store, setStore, _, ready] = persisted(
       Persist.global("server", ["server.v3"]),
       createStore({
+        // List of known server URLs
         list: [] as string[],
+        // Projects per server
         projects: {} as Record<string, StoredProject[]>,
+        // Last opened project per server
         lastProject: {} as Record<string, string>,
       }),
     )
 
+    // Local state for active server and health status
     const [state, setState] = createStore({
+      // Currently active server URL
       active: "",
+      // Health check result
       healthy: undefined as boolean | undefined,
     })
 
+    /**
+     * Check if the current server is healthy
+     * @returns true if server is healthy, false if unhealthy, undefined if unknown
+     */
     const healthy = () => state.healthy
 
+    /**
+     * Set the active server by URL
+     * @param input - Server URL to set as active
+     */
     function setActive(input: string) {
       const url = normalizeServerUrl(input)
       if (!url) return
       setState("active", url)
     }
 
+    /**
+     * Add a server to the list and set it as active
+     * - Skips if URL matches the default server
+     * - Avoids duplicates in the list
+     * @param input - Server URL to add
+     */
     function add(input: string) {
       const url = normalizeServerUrl(input)
       if (!url) return
 
+      // Don't add if it's the default server
       const fallback = normalizeServerUrl(props.defaultUrl)
       if (fallback && url === fallback) {
         setState("active", url)
@@ -64,6 +113,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       }
 
       batch(() => {
+        // Add to list if not already present
         if (!store.list.includes(url)) {
           setStore("list", store.list.length, url)
         }
@@ -71,11 +121,17 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       })
     }
 
+    /**
+     * Remove a server from the list
+     * - Switches to the first available server if removing the active one
+     * @param input - Server URL to remove
+     */
     function remove(input: string) {
       const url = normalizeServerUrl(input)
       if (!url) return
 
       const list = store.list.filter((x) => x !== url)
+      // Select next server if removing the active one
       const next = state.active === url ? (list[0] ?? normalizeServerUrl(props.defaultUrl) ?? "") : state.active
 
       batch(() => {
@@ -84,6 +140,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       })
     }
 
+    // Initialize active server from default URL when ready
     createEffect(() => {
       if (!ready()) return
       if (state.active) return
@@ -92,11 +149,26 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       setState("active", url)
     })
 
+    /**
+     * Check if the server context is ready
+     * @returns true if persisted state is loaded and active server is set
+     */
     const isReady = createMemo(() => ready() && !!state.active)
 
+    // Get platform-specific fetch implementation
     const fetcher = platform.fetch ?? globalThis.fetch
+    /**
+     * Check if a server is healthy
+     * @param url - Server URL to check
+     * @returns Promise that resolves to true if server is healthy
+     */
     const check = (url: string) => checkServerHealth(url, fetcher).then((x) => x.healthy)
 
+    /**
+     * Periodically check server health
+     * - Runs every 10 seconds
+     * - Stops when component unmounts or active server changes
+     */
     createEffect(() => {
       const url = state.active
       if (!url) return
@@ -107,10 +179,12 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       let busy = false
 
       const run = () => {
+        // Skip if previous check is still running
         if (busy) return
         busy = true
         void check(url)
           .then((next) => {
+            // Component unmounted
             if (!alive) return
             setState("healthy", next)
           })
@@ -119,7 +193,9 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
           })
       }
 
+      // Initial check
       run()
+      // Check every 10 seconds
       const interval = setInterval(run, 10_000)
 
       onCleanup(() => {
@@ -128,8 +204,20 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       })
     })
 
+    /**
+     * Get the storage key for the current server's projects
+     * @returns Storage key ("local" for localhost, full URL otherwise)
+     */
     const origin = createMemo(() => projectsKey(state.active))
+    /**
+     * Get the list of projects for the current server
+     * @returns Array of stored projects
+     */
     const projectsList = createMemo(() => store.projects[origin()] ?? [])
+    /**
+     * Check if the current server is local (localhost/127.0.0.1)
+     * @returns true if local server
+     */
     const isLocal = createMemo(() => origin() === "local")
 
     return {
@@ -148,8 +236,18 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       setActive,
       add,
       remove,
+      /**
+       * Project management methods
+       * Projects are stored per-server origin to track open directories
+       */
       projects: {
         list: projectsList,
+        /**
+         * Open a project in the project list
+         * - Adds to the beginning of the list
+         * - Skips if already present
+         * @param directory - Worktree directory path
+         */
         open(directory: string) {
           const key = origin()
           if (!key) return
@@ -157,6 +255,10 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
           if (current.find((x) => x.worktree === directory)) return
           setStore("projects", key, [{ worktree: directory, expanded: true }, ...current])
         },
+        /**
+         * Close a project (remove from list)
+         * @param directory - Worktree directory path
+         */
         close(directory: string) {
           const key = origin()
           if (!key) return
@@ -167,6 +269,10 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
             current.filter((x) => x.worktree !== directory),
           )
         },
+        /**
+         * Mark a project as expanded in the UI
+         * @param directory - Worktree directory path
+         */
         expand(directory: string) {
           const key = origin()
           if (!key) return
@@ -174,6 +280,10 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
           const index = current.findIndex((x) => x.worktree === directory)
           if (index !== -1) setStore("projects", key, index, "expanded", true)
         },
+        /**
+         * Mark a project as collapsed in the UI
+         * @param directory - Worktree directory path
+         */
         collapse(directory: string) {
           const key = origin()
           if (!key) return
@@ -181,6 +291,11 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
           const index = current.findIndex((x) => x.worktree === directory)
           if (index !== -1) setStore("projects", key, index, "expanded", false)
         },
+        /**
+         * Move a project to a different position in the list
+         * @param directory - Worktree directory path to move
+         * @param toIndex - Target index in the list
+         */
         move(directory: string, toIndex: number) {
           const key = origin()
           if (!key) return
@@ -192,11 +307,19 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
           result.splice(toIndex, 0, item)
           setStore("projects", key, result)
         },
+        /**
+         * Get the last opened project for the current server
+         * @returns Last project directory or undefined
+         */
         last() {
           const key = origin()
           if (!key) return
           return store.lastProject[key]
         },
+        /**
+         * Set a project as the last opened for the current server
+         * @param directory - Worktree directory path
+         */
         touch(directory: string) {
           const key = origin()
           if (!key) return

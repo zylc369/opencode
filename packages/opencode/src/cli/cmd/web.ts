@@ -55,6 +55,7 @@ export const WebCommand = cmd({
 
     const opts = await resolveNetworkOptions(args)
     log.info(`opts=${JSON.stringify(opts)}`)
+    // will open a server
     const server = Server.listen(opts)
     UI.empty()
     UI.println(UI.logo("  "))
