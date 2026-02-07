@@ -174,6 +174,16 @@ export namespace Storage {
     }
   })
 
+  function _printFileInfo(tag: string, target: string, content: any): void {
+    if (typeof content === "object") {
+      log.info(
+        `${tag} file success: ${target}${content?.directory ? `, directory: ${content.directory}` : ""}${content?.worktree ? `, worktree: ${content.worktree}` : ""}`,
+      )
+      return
+    }
+    log.info(`${tag} file success: ${target}, content type:${typeof content}`)
+  }
+
   /**
    * Remove a file from storage by key
    * @param key - Path segments to the file (without .json extension)
@@ -198,6 +208,9 @@ export namespace Storage {
     return withErrorHandling(async () => {
       using _ = await Lock.read(target)
       const result = await Bun.file(target).json()
+
+      _printFileInfo("read", target, result)
+
       return result as T
     })
   }
@@ -216,7 +229,8 @@ export namespace Storage {
       const content = await Bun.file(target).json()
       fn(content)
       await Bun.write(target, JSON.stringify(content, null, 2))
-      log.info(`update file success: ${target}`)
+      _printFileInfo("update", target, content)
+
       return content as T
     })
   }
@@ -232,7 +246,7 @@ export namespace Storage {
     return withErrorHandling(async () => {
       using _ = await Lock.write(target)
       await Bun.write(target, JSON.stringify(content, null, 2))
-      log.info(`write file success: ${target}`)
+      _printFileInfo("write", target, content)
     })
   }
 
