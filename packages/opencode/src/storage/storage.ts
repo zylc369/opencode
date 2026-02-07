@@ -216,6 +216,7 @@ export namespace Storage {
       const content = await Bun.file(target).json()
       fn(content)
       await Bun.write(target, JSON.stringify(content, null, 2))
+      log.info(`update file success: ${target}`)
       return content as T
     })
   }
@@ -231,6 +232,7 @@ export namespace Storage {
     return withErrorHandling(async () => {
       using _ = await Lock.write(target)
       await Bun.write(target, JSON.stringify(content, null, 2))
+      log.info(`write file success: ${target}`)
     })
   }
 

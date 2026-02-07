@@ -681,14 +681,22 @@ export namespace Server {
     mdnsDomain?: string
     cors?: string[]
   }) {
+    // Store CORS whitelist for use in middleware
     _corsWhitelist = opts.cors ?? []
 
+    // Prepare Bun.serve arguments with app fetch handler and WebSocket support
+    // idleTimeout: Disable idle timeout for long-lived connections
+    // fetch: Hono app's fetch handler
+    // websocket: WebSocket support
     const args = {
       hostname: opts.hostname,
       idleTimeout: 0,
       fetch: App().fetch,
       websocket: websocket,
     } as const
+
+    // Helper function to try starting server on a given port
+    // Returns undefined if port is already in use
     const tryServe = (port: number) => {
       try {
         return Bun.serve({ ...args, port })
@@ -696,11 +704,17 @@ export namespace Server {
         return undefined
       }
     }
+
+    // Start server on specified port, or fallback ports if port is 0
+    // If port is 0, try 4096 first, then random available port
     const server = opts.port === 0 ? (tryServe(4096) ?? tryServe(0)) : tryServe(opts.port)
     if (!server) throw new Error(`Failed to start server on port ${opts.port}`)
 
+    // Store the server URL for use in other parts of the app
     _url = server.url
+    log.info(`server url: ${_url}`)
 
+    // Determine if mDNS should be published (only for non-loopback hostnames)
     const shouldPublishMDNS =
       opts.mdns &&
       server.port &&
@@ -713,6 +727,7 @@ export namespace Server {
       log.warn("mDNS enabled but hostname is loopback; skipping mDNS publish")
     }
 
+    // Wrap server.stop() to also unpublish mDNS when stopping
     const originalStop = server.stop.bind(server)
     server.stop = async (closeActiveConnections?: boolean) => {
       if (shouldPublishMDNS) MDNS.unpublish()

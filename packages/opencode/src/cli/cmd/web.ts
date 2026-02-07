@@ -7,6 +7,7 @@ import open from "open"
 import { networkInterfaces } from "os"
 import { Runtime } from "@/runtime"
 import { UrlHelper } from "@opencode-ai/util/url-helper"
+import { Log } from "@/util/log"
 
 function getNetworkIPs() {
   const nets = networkInterfaces()
@@ -39,8 +40,12 @@ export const WebCommand = cmd({
     }),
   describe: "start opencode server and open web interface",
   handler: async (args) => {
+    const log = Log.create({ service: "WebCommand" })
+
     if (!Flag.OPENCODE_SERVER_PASSWORD) {
-      UI.println(UI.Style.TEXT_WARNING_BOLD + "!  " + "OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
+      const logContent = "!  " + "OPENCODE_SERVER_PASSWORD is not set; server is unsecured."
+      UI.println(UI.Style.TEXT_WARNING_BOLD + logContent)
+      log.info(logContent)
     }
 
     if (args.unmatchedRequestProxy) {
@@ -49,6 +54,7 @@ export const WebCommand = cmd({
     }
 
     const opts = await resolveNetworkOptions(args)
+    log.info(`opts=${JSON.stringify(opts)}`)
     const server = Server.listen(opts)
     UI.empty()
     UI.println(UI.logo("  "))
@@ -58,32 +64,31 @@ export const WebCommand = cmd({
       // Show localhost for local access
       const localhostUrl = `http://localhost:${server.port}`
       UI.println(UI.Style.TEXT_INFO_BOLD + "  Local access:      ", UI.Style.TEXT_NORMAL, localhostUrl)
+      log.info(`Local access: ${localhostUrl}`)
 
       // Show network IPs for remote access
       const networkIPs = getNetworkIPs()
       if (networkIPs.length > 0) {
         for (const ip of networkIPs) {
-          UI.println(
-            UI.Style.TEXT_INFO_BOLD + "  Network access:    ",
-            UI.Style.TEXT_NORMAL,
-            `http://${ip}:${server.port}`,
-          )
+          const url = `http://${ip}:${server.port}`
+          UI.println(UI.Style.TEXT_INFO_BOLD + "  Network access:    ", UI.Style.TEXT_NORMAL, url)
+          log.info(`Network access: ${url}`)
         }
       }
 
       if (opts.mdns) {
-        UI.println(
-          UI.Style.TEXT_INFO_BOLD + "  mDNS:              ",
-          UI.Style.TEXT_NORMAL,
-          `${opts.mdnsDomain}:${server.port}`,
-        )
+        const mdns = `${opts.mdnsDomain}:${server.port}`
+        UI.println(UI.Style.TEXT_INFO_BOLD + "  mDNS:              ", UI.Style.TEXT_NORMAL, mdns)
+        log.info(`mDNS: ${mdns}`)
       }
 
       // Open localhost in browser
+      log.info(`Open localhost in browser: ${localhostUrl}`)
       open(localhostUrl.toString()).catch(() => {})
     } else {
       const displayUrl = server.url.toString()
       UI.println(UI.Style.TEXT_INFO_BOLD + "  Web interface:    ", UI.Style.TEXT_NORMAL, displayUrl)
+      log.info(`Open localhost in browser: ${displayUrl}, hostname: ${opts.hostname}`)
       open(displayUrl).catch(() => {})
     }
 

@@ -56,6 +56,7 @@ export namespace Log {
   }
 
   export async function init(options: Options) {
+    process.stderr.write(`[Log][init]level=${options.level},print=${options.print},dev=${options.dev}\n`)
     if (options.level) level = options.level
     cleanup(Global.Path.log)
     if (options.print) return
@@ -63,6 +64,7 @@ export namespace Log {
       Global.Path.log,
       options.dev ? "dev.log" : new Date().toISOString().split(".")[0].replace(/:/g, "") + ".log",
     )
+    process.stderr.write(`[Log][init]logpath=${logpath}\n`)
     const logfile = Bun.file(logpath)
     await fs.truncate(logpath).catch(() => {})
     const writer = logfile.writer()
@@ -106,7 +108,7 @@ export namespace Log {
       }
     }
 
-    function build(message: any, extra?: Record<string, any>) {
+    function buildV1(message: any, extra?: Record<string, any>) {
       const prefix = Object.entries({
         ...tags,
         ...extra,
@@ -124,6 +126,25 @@ export namespace Log {
       last = next.getTime()
       return [next.toISOString().split(".")[0], "+" + diff + "ms", prefix, message].filter(Boolean).join(" ") + "\n"
     }
+    function buildV2(message: any, extra?: Record<string, any>) {
+      const prefix = Object.entries({
+        ...tags,
+        ...extra,
+      })
+        .filter(([_, value]) => value !== undefined && value !== null)
+        .map(([key, value]) => {
+          const prefix = `${key}=`
+          if (value instanceof Error) return prefix + formatError(value)
+          if (typeof value === "object") return prefix + JSON.stringify(value)
+          return prefix + value
+        })
+        .join(", ")
+      const next = new Date()
+      const diff = next.getTime() - last
+      last = next.getTime()
+      return `${next.toISOString().split(".")[0]} ${("+" + diff + "ms").padStart(6)} [${prefix}] ${message}\n`
+    }
+    const build = buildV2
     const result: Logger = {
       debug(message?: any, extra?: Record<string, any>) {
         if (shouldLog("DEBUG")) {
