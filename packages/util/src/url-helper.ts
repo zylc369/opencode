@@ -1,4 +1,22 @@
 export namespace UrlHelper {
+  export function getProtocolHostWithPort(url: string): string {
+    if (!url?.trim()) return ""
+
+    // 确保有协议
+    const normalizedUrl = url.includes("://") ? url : `http://${url}`
+    try {
+      const urlObj = new URL(normalizedUrl)
+
+      // 如果有端口号，返回 hostname:port，否则只返回 hostname
+      return `${urlObj.protocol}//${urlObj.hostname}${urlObj.port ? `:${urlObj.port}` : ""}`
+    } catch {
+      // 如果解析失败，尝试使用字符串匹配
+      // 提取到第一个 / 或 ? 或 # 之前的部分
+      const hostPart = normalizedUrl.split(/[/?#]/)[0]
+      return hostPart
+    }
+  }
+
   /**
    * 提取完整主机（hostname:port）
    * 对于 localhost:3000 会返回 "localhost:3000"
@@ -15,7 +33,7 @@ export namespace UrlHelper {
       const urlObj = new URL(normalizedUrl)
 
       // 如果有端口号，返回 hostname:port，否则只返回 hostname
-      return urlObj.port ? `${urlObj.hostname}:${urlObj.port}` : urlObj.hostname
+      return `${urlObj.hostname}${urlObj.port ? `:${urlObj.port}` : ""}`
     } catch {
       // 如果解析失败，尝试直接提取主机部分
       // 移除协议

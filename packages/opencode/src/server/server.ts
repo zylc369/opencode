@@ -10,7 +10,6 @@ import { basicAuth } from "hono/basic-auth"
 import z from "zod"
 import { Provider } from "../provider/provider"
 import { NamedError } from "@opencode-ai/util/error"
-import { Identifier } from "@opencode-ai/util/identifier"
 import { UrlHelper } from "@opencode-ai/util/url-helper"
 import { LSP } from "../lsp"
 import { Format } from "../format"
@@ -615,14 +614,15 @@ export namespace Server {
         )
         /**
          * Catch-all proxy route
-         * Proxies all unmatched requests to the frontend dev server
+         * Proxies all unmatched requests to the server
          * Forwards the request and sets CSP headers on the response
          */
         .all("/*", async (c) => {
           const path = c.req.path
           const unMatchedRequestProxy = Runtime.Global.getUnMatchedRequestProxy()
           const proxyUrl = `${unMatchedRequestProxy}${path}`
-          const host = UrlHelper.getHostnameOnly(unMatchedRequestProxy)
+          const host = UrlHelper.getHostWithPort(unMatchedRequestProxy)
+
           const params: RequestInit = {
             ...c.req,
             headers: {
@@ -631,12 +631,12 @@ export namespace Server {
             },
           }
 
-          const requestId = `HTTP#${Identifier.randomBase62(8)}`
-          log.info(`[requestId=${requestId}][Request]proxyUrl=${proxyUrl},request=${JSON.stringify(params)}`)
+          // const requestId = `HTTP#${Identifier.randomBase62(8)}`
+          // log.info(`[requestId=${requestId}][Request]proxyUrl=${proxyUrl},request=${JSON.stringify(params)}`)
           const response = await proxy(proxyUrl, params)
-          log.info(
-            `[requestId=${requestId}][Response]status=${response.status},statusText=${response.statusText},bodyType=${response.headers.get("content-type")},headers=${Object.fromEntries(response.headers.entries())}`,
-          )
+          // log.info(
+          //   `[requestId=${requestId}][Response]status=${response.status},statusText=${response.statusText},bodyType=${response.headers.get("content-type")},headers=${Object.fromEntries(response.headers.entries())}`,
+          // )
 
           response.headers.set(
             "Content-Security-Policy",

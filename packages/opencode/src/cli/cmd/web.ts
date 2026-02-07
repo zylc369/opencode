@@ -5,6 +5,8 @@ import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import { Flag } from "../../flag/flag"
 import open from "open"
 import { networkInterfaces } from "os"
+import { Runtime } from "@/runtime"
+import { UrlHelper } from "@opencode-ai/util/url-helper"
 
 function getNetworkIPs() {
   const nets = networkInterfaces()
@@ -30,12 +32,22 @@ function getNetworkIPs() {
 
 export const WebCommand = cmd({
   command: "web",
-  builder: (yargs) => withNetworkOptions(yargs),
+  builder: (yargs) =>
+    withNetworkOptions(yargs).option("unmatched-request-proxy", {
+      type: "string",
+      describe: "custom unmatched request proxy",
+    }),
   describe: "start opencode server and open web interface",
   handler: async (args) => {
     if (!Flag.OPENCODE_SERVER_PASSWORD) {
       UI.println(UI.Style.TEXT_WARNING_BOLD + "!  " + "OPENCODE_SERVER_PASSWORD is not set; server is unsecured.")
     }
+
+    if (args.unmatchedRequestProxy) {
+      const unmatchedRequestProxy = UrlHelper.getProtocolHostWithPort(args.unmatchedRequestProxy)
+      Runtime.Global.setUnMatchedRequestProxy(unmatchedRequestProxy)
+    }
+
     const opts = await resolveNetworkOptions(args)
     const server = Server.listen(opts)
     UI.empty()
