@@ -3,6 +3,10 @@ export namespace Rpc {
     [method: string]: (input: any) => any
   }
 
+  /**
+   * Listen message from main thread.
+   * @param rpc from worker.ts
+   */
   export function listen(rpc: Definition) {
     onmessage = async (evt) => {
       const parsed = JSON.parse(evt.data)
@@ -13,6 +17,11 @@ export namespace Rpc {
     }
   }
 
+  /**
+   * emit message to main thread
+   * @param event
+   * @param data
+   */
   export function emit(event: string, data: unknown) {
     postMessage(JSON.stringify({ type: "rpc.event", event, data }))
   }
@@ -24,6 +33,8 @@ export namespace Rpc {
     const pending = new Map<number, (result: any) => void>()
     const listeners = new Map<string, Set<(data: any) => void>>()
     let id = 0
+
+    // Listen message from worker thread
     target.onmessage = async (evt) => {
       const parsed = JSON.parse(evt.data)
       if (parsed.type === "rpc.result") {
@@ -47,6 +58,7 @@ export namespace Rpc {
         const requestId = id++
         return new Promise((resolve) => {
           pending.set(requestId, resolve)
+          // post message to worker thread -> to listen function
           target.postMessage(JSON.stringify({ type: "rpc.request", method, input, id: requestId }))
         })
       },

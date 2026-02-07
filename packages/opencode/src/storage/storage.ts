@@ -9,11 +9,19 @@ import { $ } from "bun"
 import { NamedError } from "@opencode-ai/util/error"
 import z from "zod"
 
+/**
+ * Storage namespace for managing persistent data storage
+ * Handles file-based storage with migrations, locking, and error handling
+ */
 export namespace Storage {
   const log = Log.create({ service: "storage" })
 
+  /** Migration function type for updating storage schema */
   type Migration = (dir: string) => Promise<void>
 
+  /**
+   * Error thrown when a requested resource is not found in storage
+   */
   export const NotFoundError = NamedError.create(
     "NotFoundError",
     z.object({
@@ -21,6 +29,10 @@ export namespace Storage {
     }),
   )
 
+  /**
+   * Array of migration functions to update storage schema
+   * Each migration transforms data from an older format to a newer one
+   */
   const MIGRATIONS: Migration[] = [
     async (dir) => {
       const project = path.resolve(dir, "../project")
@@ -141,6 +153,10 @@ export namespace Storage {
     },
   ]
 
+  /**
+   * Lazy-initialized storage state
+   * Runs pending migrations on first access and returns the storage directory
+   */
   const state = lazy(async () => {
     const dir = path.join(Global.Path.data, "storage")
     const migration = await Bun.file(path.join(dir, "migration"))
@@ -158,6 +174,10 @@ export namespace Storage {
     }
   })
 
+  /**
+   * Remove a file from storage by key
+   * @param key - Path segments to the file (without .json extension)
+   */
   export async function remove(key: string[]) {
     const dir = await state().then((x) => x.dir)
     const target = path.join(dir, ...key) + ".json"
@@ -166,6 +186,12 @@ export namespace Storage {
     })
   }
 
+  /**
+   * Read a file from storage by key
+   * @param key - Path segments to the file (without .json extension)
+   * @returns Parsed JSON content of the file
+   * @throws NotFoundError if the file doesn't exist
+   */
   export async function read<T>(key: string[]) {
     const dir = await state().then((x) => x.dir)
     const target = path.join(dir, ...key) + ".json"
@@ -176,6 +202,12 @@ export namespace Storage {
     })
   }
 
+  /**
+   * Update a file in storage by applying a function to its content
+   * @param key - Path segments to the file (without .json extension)
+   * @param fn - Function to modify the parsed content
+   * @returns The updated content
+   */
   export async function update<T>(key: string[], fn: (draft: T) => void) {
     const dir = await state().then((x) => x.dir)
     const target = path.join(dir, ...key) + ".json"
@@ -188,6 +220,11 @@ export namespace Storage {
     })
   }
 
+  /**
+   * Write content to a file in storage
+   * @param key - Path segments to the file (without .json extension)
+   * @param content - Content to write as JSON
+   */
   export async function write<T>(key: string[], content: T) {
     const dir = await state().then((x) => x.dir)
     const target = path.join(dir, ...key) + ".json"
@@ -197,6 +234,11 @@ export namespace Storage {
     })
   }
 
+  /**
+   * Wrapper for error handling in storage operations
+   * Converts ENOENT errors to NotFoundError
+   * @internal
+   */
   async function withErrorHandling<T>(body: () => Promise<T>) {
     return body().catch((e) => {
       if (!(e instanceof Error)) throw e
@@ -209,6 +251,12 @@ export namespace Storage {
   }
 
   const glob = new Bun.Glob("**/*")
+
+  /**
+   * List all files in storage with a given prefix
+   * @param prefix - Path segments to filter by
+   * @returns Array of file paths (without .json extension)
+   */
   export async function list(prefix: string[]) {
     const dir = await state().then((x) => x.dir)
     try {
