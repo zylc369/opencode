@@ -10,6 +10,8 @@ import { basicAuth } from "hono/basic-auth"
 import z from "zod"
 import { Provider } from "../provider/provider"
 import { NamedError } from "@opencode-ai/util/error"
+import { Identifier } from "@opencode-ai/util/identifier"
+import { UrlHelper } from "@opencode-ai/util/url-helper"
 import { LSP } from "../lsp"
 import { Format } from "../format"
 import { TuiRoutes } from "./routes/tui"
@@ -40,16 +42,25 @@ import { QuestionRoutes } from "./routes/question"
 import { PermissionRoutes } from "./routes/permission"
 import { GlobalRoutes } from "./routes/global"
 import { MDNS } from "./mdns"
+import { Runtime } from "@/runtime"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
 
+/**
+ * Main server namespace for OpenCode API
+ * Handles HTTP requests, WebSocket connections, and proxies to frontend
+ */
 export namespace Server {
   const log = Log.create({ service: "server" })
 
   let _url: URL | undefined
   let _corsWhitelist: string[] = []
 
+  /**
+   * Get the server URL
+   * @returns The URL the server is listening on, or default localhost:4096
+   */
   export function url(): URL {
     return _url ?? new URL("http://localhost:4096")
   }
@@ -59,6 +70,10 @@ export namespace Server {
     () =>
       // TODO: Break server.ts into smaller route files to fix type inference
       app
+        /**
+         * Global error handler
+         * Catches all errors and returns appropriate JSON responses
+         */
         .onError((err, c) => {
           log.error("failed", {
             error: err,
@@ -77,12 +92,20 @@ export namespace Server {
             status: 500,
           })
         })
+        /**
+         * Basic authentication middleware
+         * Requires password if OPENCODE_SERVER_PASSWORD flag is set
+         */
         .use((c, next) => {
           const password = Flag.OPENCODE_SERVER_PASSWORD
           if (!password) return next()
           const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
           return basicAuth({ username, password })(c, next)
         })
+        /**
+         * Request logging middleware
+         * Logs all requests with timing information (except /log endpoint to avoid infinite loops)
+         */
         .use(async (c, next) => {
           const skipLogging = c.req.path === "/log"
           if (!skipLogging) {
@@ -100,6 +123,10 @@ export namespace Server {
             timer.stop()
           }
         })
+        /**
+         * CORS middleware
+         * Allows cross-origin requests from localhost, 127.0.0.1, tauri, and *.opencode.ai
+         */
         .use(
           cors({
             origin(input) {
@@ -122,6 +149,10 @@ export namespace Server {
           }),
         )
         .route("/global", GlobalRoutes())
+        /**
+         * PUT /auth/:providerID
+         * Set authentication credentials for a provider
+         */
         .put(
           "/auth/:providerID",
           describeRoute({
@@ -154,6 +185,10 @@ export namespace Server {
             return c.json(true)
           },
         )
+        /**
+         * DELETE /auth/:providerID
+         * Remove authentication credentials for a provider
+         */
         .delete(
           "/auth/:providerID",
           describeRoute({
@@ -184,6 +219,10 @@ export namespace Server {
             return c.json(true)
           },
         )
+        /**
+         * Instance provider middleware
+         * Extracts directory from query param or header and provides instance context
+         */
         .use(async (c, next) => {
           if (c.req.path === "/log") return next()
           const raw = c.req.query("directory") || c.req.header("x-opencode-directory") || process.cwd()
@@ -202,6 +241,10 @@ export namespace Server {
             },
           })
         })
+        /**
+         * GET /doc
+         * OpenAPI documentation endpoint
+         */
         .get(
           "/doc",
           openAPIRouteHandler(app, {
@@ -227,6 +270,10 @@ export namespace Server {
         .route("/", FileRoutes())
         .route("/mcp", McpRoutes())
         .route("/tui", TuiRoutes())
+        /**
+         * POST /instance/dispose
+         * Clean up and dispose the current OpenCode instance
+         */
         .post(
           "/instance/dispose",
           describeRoute({
@@ -249,6 +296,10 @@ export namespace Server {
             return c.json(true)
           },
         )
+        /**
+         * GET /path
+         * Get path information (home, state, config, worktree, directory)
+         */
         .get(
           "/path",
           describeRoute({
@@ -289,6 +340,10 @@ export namespace Server {
             })
           },
         )
+        /**
+         * GET /vcs
+         * Get version control system information (e.g., git branch)
+         */
         .get(
           "/vcs",
           describeRoute({
@@ -314,6 +369,10 @@ export namespace Server {
             })
           },
         )
+        /**
+         * GET /command
+         * List all available commands
+         */
         .get(
           "/command",
           describeRoute({
@@ -336,6 +395,10 @@ export namespace Server {
             return c.json(commands)
           },
         )
+        /**
+         * POST /log
+         * Write a log entry to server logs
+         */
         .post(
           "/log",
           describeRoute({
@@ -388,6 +451,10 @@ export namespace Server {
             return c.json(true)
           },
         )
+        /**
+         * GET /agent
+         * List all available AI agents
+         */
         .get(
           "/agent",
           describeRoute({
@@ -410,6 +477,10 @@ export namespace Server {
             return c.json(modes)
           },
         )
+        /**
+         * GET /skill
+         * List all available skills
+         */
         .get(
           "/skill",
           describeRoute({
@@ -432,6 +503,10 @@ export namespace Server {
             return c.json(skills)
           },
         )
+        /**
+         * GET /lsp
+         * Get LSP server status
+         */
         .get(
           "/lsp",
           describeRoute({
@@ -453,6 +528,10 @@ export namespace Server {
             return c.json(await LSP.status())
           },
         )
+        /**
+         * GET /formatter
+         * Get formatter status
+         */
         .get(
           "/formatter",
           describeRoute({
@@ -474,6 +553,10 @@ export namespace Server {
             return c.json(await Format.status())
           },
         )
+        /**
+         * GET /event
+         * Server-Sent Events endpoint for real-time event streaming
+         */
         .get(
           "/event",
           describeRoute({
@@ -530,24 +613,43 @@ export namespace Server {
             })
           },
         )
+        /**
+         * Catch-all proxy route
+         * Proxies all unmatched requests to the frontend dev server
+         * Forwards the request and sets CSP headers on the response
+         */
         .all("/*", async (c) => {
           const path = c.req.path
-
-          const response = await proxy(`https://app.opencode.ai${path}`, {
+          const unMatchedRequestProxy = Runtime.Global.getUnMatchedRequestProxy()
+          const proxyUrl = `${unMatchedRequestProxy}${path}`
+          const host = UrlHelper.getHostnameOnly(unMatchedRequestProxy)
+          const params: RequestInit = {
             ...c.req,
             headers: {
               ...c.req.raw.headers,
-              host: "app.opencode.ai",
+              host,
             },
-          })
+          }
+
+          const requestId = `HTTP#${Identifier.randomBase62(8)}`
+          log.info(`[requestId=${requestId}][Request]proxyUrl=${proxyUrl},request=${JSON.stringify(params)}`)
+          const response = await proxy(proxyUrl, params)
+          log.info(
+            `[requestId=${requestId}][Response]status=${response.status},statusText=${response.statusText},bodyType=${response.headers.get("content-type")},headers=${Object.fromEntries(response.headers.entries())}`,
+          )
+
           response.headers.set(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:",
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' ws://localhost:* ws://127.0.0.1:*;",
           )
           return response
         }) as unknown as Hono,
   )
 
+  /**
+   * Generate OpenAPI specification for the API
+   * @returns OpenAPI spec object
+   */
   export async function openapi() {
     // Cast to break excessive type recursion from long route chains
     const result = await generateSpecs(App() as Hono, {
@@ -563,6 +665,15 @@ export namespace Server {
     return result
   }
 
+  /**
+   * Start the HTTP server
+   * @param opts.port - Port to listen on (0 for random available port)
+   * @param opts.hostname - Hostname to bind to
+   * @param opts.mdns - Whether to publish mDNS service
+   * @param opts.mdnsDomain - Domain for mDNS service
+   * @param opts.cors - Additional CORS whitelist entries
+   * @returns Bun server instance
+   */
   export function listen(opts: {
     port: number
     hostname: string
