@@ -73,7 +73,8 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
       if (queue.length === 0) return
 
       const events = queue
-      // Double-buffer: swap queue with buffer
+      // Double-buffering is used to prevent new events from being added to the array
+      // while it is being processed during a flush operation.
       queue = buffer
       buffer = events
       queue.length = 0
@@ -111,6 +112,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
     void (async () => {
       const events = await eventSdk.global.event()
       let yielded = Date.now()
+      // eventSdk.global.event() returns an asynchronous iterable object (AsyncIterable) representing the SSE stream.
       for await (const event of events.stream) {
         const directory = event.directory ?? "global"
         const payload = event.payload

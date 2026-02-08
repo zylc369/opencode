@@ -28,8 +28,14 @@
     2. 在日志中打印请求入参和响应。
     3. 日志k=v之间空格分隔改为逗号分隔。
 6. **添加代码注释**
-7. `http.+opencode.ai.+\.([a-z])`搜索到的域名都是用于获取远端资源的，检查看能不能引用本地资源。
-8. `serverDisplayName`和`url-helper.ts`里面的`getHostWithPort`逻辑重复了。
+7. BUG FIX:
+    1. WEB页面有BUG：新打开一个目录，无法发送消息，要切换到其他项目再切换回来才能打开页面
+
+8. **快捷键相关**：
+    1. 网页上“发送按钮”的快捷键允许修改，修改到`Command/Alt/option+Enter`
+
+9. `http.+opencode.ai.+\.([a-z])`搜索到的域名都是用于获取远端资源的，检查看能不能引用本地资源。
+10. `serverDisplayName`和`url-helper.ts`里面的`getHostWithPort`逻辑重复了。
 
 
 

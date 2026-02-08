@@ -31,10 +31,13 @@ import Layout from "@/pages/layout"
 import DirectoryLayout from "@/pages/directory-layout"
 import { ErrorPage } from "./pages/error"
 import { Suspense, JSX } from "solid-js"
+import { Log } from "./utils/log"
 
 const Home = lazy(() => import("@/pages/home"))
 const Session = lazy(() => import("@/pages/session"))
 const Loading = () => <div class="size-full" />
+
+const log = Log.create({ service: "app" })
 
 function UiI18nBridge(props: ParentProps) {
   const language = useLanguage()
@@ -104,6 +107,9 @@ export function AppInterface(props: { defaultUrl?: string; children?: JSX.Elemen
 
     return window.location.origin
   }
+
+  const defaultUrl = defaultServerUrl()
+  log.info(`defaultUrl=${defaultUrl}`)
 
   return (
     <ServerProvider defaultUrl={defaultServerUrl()}>
