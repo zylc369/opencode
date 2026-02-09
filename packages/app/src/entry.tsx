@@ -5,8 +5,11 @@ import { Platform, PlatformProvider } from "@/context/platform"
 import { dict as en } from "@/i18n/en"
 import { dict as zh } from "@/i18n/zh"
 import pkg from "../package.json"
+import { Log } from "./utils/log"
 
 const DEFAULT_SERVER_URL_KEY = "opencode.settings.dat:defaultServerUrl"
+
+const log = Log.create({ service: "entry" })
 
 const root = document.getElementById("root")
 if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
@@ -41,7 +44,10 @@ const platform: Platform = {
     window.location.reload()
   },
   notify: async (title, description, href) => {
-    if (!("Notification" in window)) return
+    if (!("Notification" in window)) {
+      log.warn("Notification not found in window!")
+      return
+    }
 
     const permission =
       Notification.permission === "default"

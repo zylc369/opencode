@@ -4,6 +4,9 @@ import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { batch, onCleanup } from "solid-js"
 import { usePlatform } from "./platform"
 import { useServer } from "./server"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "global-sdk" })
 
 /**
  * Global SDK context for managing OpenCode API client and Server-Sent Events
@@ -34,6 +37,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
     type Queued = { directory: string; payload: Event }
 
     // Event queue for batching/coalescing
+    // Messages from the server are placed in the queue.
     let queue: Array<Queued | undefined> = []
     let buffer: Array<Queued | undefined> = []
     /** Map of coalesced event keys to their queue indices */
@@ -61,7 +65,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
     }
 
     /**
-     * Flush all queued events to the emitter
+     * Flush all queued server events to the emitter
      * - Swaps queue with buffer for double-buffering
      * - Clears coalesced map
      * - Batches all events in a single SolidJS batch
@@ -81,7 +85,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
       coalesced.clear()
 
       last = Date.now()
-      // Emit all events in a single batch to minimize re-renders
+      // Emit all server events in a single batch to minimize re-renders
       batch(() => {
         for (const event of events) {
           if (!event) continue
@@ -104,7 +108,7 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
     }
 
     /**
-     * SSE event stream processor
+     * SSE event stream processor, loop listening for events
      * - Connects to /event endpoint
      * - Coalesces high-frequency events (LSP, message parts)
      * - Yields to event loop every ~8ms to prevent blocking
@@ -141,7 +145,11 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
       // Flush remaining events on disconnect
       .finally(flush)
       // Ignore connection errors
-      .catch(() => undefined)
+      .catch((err) =>
+        log.error("Event loop exception", {
+          error: err,
+        }),
+      )
 
     // Cleanup on unmount
     onCleanup(() => {
