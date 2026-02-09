@@ -4,6 +4,9 @@ import { createStore } from "solid-js/store"
 import { usePlatform } from "@/context/platform"
 import { Persist, persisted } from "@/utils/persist"
 import { checkServerHealth } from "@/utils/server-health"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "server" })
 
 /** Stored project information with worktree path and expanded state */
 type StoredProject = { worktree: string; expanded: boolean }
@@ -92,6 +95,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
     function setActive(input: string) {
       const url = normalizeServerUrl(input)
       if (!url) return
+      log.info(`[setActive][setState][active] input=${input}, url=${url}`)
       setState("active", url)
     }
 
@@ -108,11 +112,14 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       // Don't add if it's the default server
       const fallback = normalizeServerUrl(props.defaultUrl)
       if (fallback && url === fallback) {
+        log.info(`[add][setState][active] url === fallback, input=${input}, url=${url}, fallback=${fallback}`)
         setState("active", url)
         return
       }
 
       batch(() => {
+        log.info(`[add][setState][active] In batch. url !== fallback, input=${input}, url=${url}, fallback=${fallback}`)
+
         // Add to list if not already present
         if (!store.list.includes(url)) {
           setStore("list", store.list.length, url)
@@ -135,6 +142,8 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       const next = state.active === url ? (list[0] ?? normalizeServerUrl(props.defaultUrl) ?? "") : state.active
 
       batch(() => {
+        log.info(`[remove][setState][active] url !== fallback, input=${input}, url=${url}`)
+
         setStore("list", list)
         setState("active", next)
       })
@@ -142,10 +151,15 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
 
     // Initialize active server from default URL when ready
     createEffect(() => {
-      if (!ready()) return
+      if (!ready()) {
+        log.info(`[createEffect] not ready`)
+        return
+      }
       if (state.active) return
       const url = normalizeServerUrl(props.defaultUrl)
       if (!url) return
+
+      log.info(`[createEffect][setState][active] url=${url}, defaultUrl=${props.defaultUrl}`)
       setState("active", url)
     })
 
@@ -173,6 +187,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       const url = state.active
       if (!url) return
 
+      log.info(`[createEffect][setState][healthy] url=${url}`)
       setState("healthy", undefined)
 
       let alive = true
@@ -208,17 +223,31 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
      * Get the storage key for the current server's projects
      * @returns Storage key ("local" for localhost, full URL otherwise)
      */
-    const origin = createMemo(() => projectsKey(state.active))
+    const origin = createMemo(() => {
+      const result = projectsKey(state.active)
+      log.info(`[origin] active=${state.active}, projectsKey=${result}`)
+      return result
+    })
     /**
      * Get the list of projects for the current server
      * @returns Array of stored projects
      */
-    const projectsList = createMemo(() => store.projects[origin()] ?? [])
+    const projectsList = createMemo(() => {
+      const key = origin()
+      const result = store.projects[key] ?? []
+      log.info(`[projectsList] key(from origin)=${key},projectsList=${JSON.stringify(result)}`)
+      return result
+    })
     /**
      * Check if the current server is local (localhost/127.0.0.1)
      * @returns true if local server
      */
-    const isLocal = createMemo(() => origin() === "local")
+    const isLocal = createMemo(() => {
+      const originValue = origin()
+      const result = originValue === "local"
+      log.info(`[isLocal] origin=${originValue},isLocal=${result}`)
+      return result
+    })
 
     return {
       ready: isReady,
