@@ -15,6 +15,10 @@ import {
 } from "./types"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./eviction"
 
+/**
+ * Create a child store manager for directory-specific state
+ * Manages lifecycle, caching, and memory-efficient state disposal
+ */
 export function createChildStoreManager(input: {
   owner: Owner
   markStats: (activeDirectoryStores: number) => void
@@ -33,18 +37,30 @@ export function createChildStoreManager(input: {
   const ownerPins = new WeakMap<object, Set<string>>()
   const disposers = new Map<string, () => void>()
 
+  /**
+   * Mark a directory as accessed (updates lastAccessAt timestamp)
+   * @param directory - Directory path to mark
+   */
   const mark = (directory: string) => {
     if (!directory) return
     lifecycle.set(directory, { lastAccessAt: Date.now() })
     runEviction()
   }
 
+  /**
+   * Pin a directory to prevent it from being evicted
+   * @param directory - Directory path to pin
+   */
   const pin = (directory: string) => {
     if (!directory) return
     pins.set(directory, (pins.get(directory) ?? 0) + 1)
     mark(directory)
   }
 
+  /**
+   * Unpin a directory (decreases pin count, allows eviction when 0)
+   * @param directory - Directory path to unpin
+   */
   const unpin = (directory: string) => {
     if (!directory) return
     const next = (pins.get(directory) ?? 0) - 1
@@ -56,8 +72,18 @@ export function createChildStoreManager(input: {
     runEviction()
   }
 
+  /**
+   * Check if a directory is pinned (prevents eviction)
+   * @param directory - Directory path to check
+   * @returns true if directory is pinned
+   */
   const pinned = (directory: string) => (pins.get(directory) ?? 0) > 0
 
+  /**
+   * Pin a directory for the current component owner
+   * Pin is automatically released when component unmounts
+   * @param directory - Directory path to pin
+   */
   const pinForOwner = (directory: string) => {
     const current = getOwner()
     if (!current) return
@@ -78,6 +104,11 @@ export function createChildStoreManager(input: {
     })
   }
 
+  /**
+   * Dispose a directory's store and all associated caches
+   * @param directory - Directory path to dispose
+   * @returns true if successfully disposed
+   */
   function disposeDirectory(directory: string) {
     if (
       !canDisposeDirectory({
@@ -106,6 +137,10 @@ export function createChildStoreManager(input: {
     return true
   }
 
+  /**
+   * Run eviction algorithm to free up memory when store limit is exceeded
+   * Disposes directories that are idle, unpinned, and not booting
+   */
   function runEviction() {
     const stores = Object.keys(children)
     if (stores.length === 0) return
@@ -124,6 +159,13 @@ export function createChildStoreManager(input: {
     }
   }
 
+  /**
+   * Ensure a child store exists for the given directory
+   * Creates persisted stores for VCS, project metadata, and icon
+   * @param directory - Directory path
+   * @returns The child store
+   * @throws Error if store creation fails
+   */
   function ensureChild(directory: string) {
     if (!directory) console.error("No directory provided")
     if (!children[directory]) {
@@ -156,6 +198,10 @@ export function createChildStoreManager(input: {
       if (!icon) throw new Error("Failed to create persisted project icon")
       iconCache.set(directory, { store: icon[0], setStore: icon[1], ready: icon[3] })
 
+      /**
+       * Initialize child store with default state
+       * Automatically syncs with persisted stores when ready
+       */
       const init = () =>
         createRoot((dispose) => {
           const child = createStore<State>({
@@ -185,15 +231,18 @@ export function createChildStoreManager(input: {
           children[directory] = child
           disposers.set(directory, dispose)
 
+          // Sync VCS info when ready
           createEffect(() => {
             if (!vcsReady()) return
             const cached = vcsStore.value
             if (!cached?.branch) return
             child[1]("vcs", (value) => value ?? cached)
           })
+          // Sync project metadata
           createEffect(() => {
             child[1]("projectMeta", meta[0].value)
           })
+          // Sync icon
           createEffect(() => {
             child[1]("icon", icon[0].value)
           })
@@ -208,6 +257,14 @@ export function createChildStoreManager(input: {
     return childStore
   }
 
+  /**
+   * Get or create a child store for the given directory
+   * Pins the directory for the current component owner
+   * Optionally bootstraps the directory if status is loading
+   * @param directory - Directory path
+   * @param options.bootstrap - Whether to bootstrap if loading (default: true)
+   * @returns The child store
+   */
   function child(directory: string, options: ChildOptions = {}) {
     const childStore = ensureChild(directory)
     pinForOwner(directory)
@@ -218,6 +275,12 @@ export function createChildStoreManager(input: {
     return childStore
   }
 
+  /**
+   * Update project metadata for a directory
+   * Merges patches with existing metadata (icon and commands are merged)
+   * @param directory - Directory path
+   * @param patch - Metadata patch to apply
+   */
   function projectMeta(directory: string, patch: ProjectMeta) {
     const [store, setStore] = ensureChild(directory)
     const cached = metaCache.get(directory)
@@ -235,6 +298,11 @@ export function createChildStoreManager(input: {
     setStore("projectMeta", next)
   }
 
+  /**
+   * Set the project icon for a directory
+   * @param directory - Directory path
+   * @param value - Icon data URL or undefined to clear
+   */
   function projectIcon(directory: string, value: string | undefined) {
     const [store, setStore] = ensureChild(directory)
     const cached = iconCache.get(directory)

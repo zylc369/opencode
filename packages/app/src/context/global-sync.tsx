@@ -35,6 +35,9 @@ import { bootstrapDirectory, bootstrapGlobal } from "./global-sync/bootstrap"
 import { sanitizeProject } from "./global-sync/utils"
 import type { ProjectMeta } from "./global-sync/types"
 import { SESSION_RECENT_LIMIT } from "./global-sync/types"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "global-sync" })
 
 // Global store type defining the application-wide state structure
 type GlobalStore = {
@@ -163,6 +166,7 @@ function createGlobalSync() {
     const cached = sdkCache.get(directory)
     if (cached) return cached
     // Create new SDK client with directory-specific configuration
+    log.info(`[sdkFor] directory=${directory}, url=${globalSDK.url}`)
     const sdk = createOpencodeClient({
       baseUrl: globalSDK.url,
       fetch: platform.fetch,
@@ -178,6 +182,7 @@ function createGlobalSync() {
     if (!projectCacheReady()) return
     if (globalStore.project.length !== 0) return
     const cached = projectCache.value
+    log.info(`[createEffect][projectCache] length=${cached.length}, cached=${JSON.stringify(cached)}`)
     if (cached.length === 0) return
     setGlobalStore("project", cached)
   })
@@ -186,6 +191,7 @@ function createGlobalSync() {
   createEffect(() => {
     if (!projectCacheReady()) return
     const projects = globalStore.project
+    log.info(`[createEffect][globalStore] length=${projects.length}, projects=${JSON.stringify(projects)}`)
     if (projects.length === 0) {
       const cachedLength = untrack(() => projectCache.value.length)
       if (cachedLength !== 0) return
@@ -196,6 +202,7 @@ function createGlobalSync() {
   // Effect to handle reload completion
   createEffect(() => {
     if (globalStore.reload !== "complete") return
+    log.info(`[createEffect][reload] current ${globalStore.reload} to undefined`)
     setGlobalStore("reload", undefined)
     queue.refresh()
   })
@@ -204,6 +211,7 @@ function createGlobalSync() {
   async function loadSessions(directory: string) {
     // Check if session loading is already in progress
     const pending = sessionLoads.get(directory)
+    log.info(`[loadSessions] directory=${directory}, pending=${pending}`)
     if (pending) return pending
 
     // Pin the directory to prevent disposal during loading
@@ -272,9 +280,13 @@ function createGlobalSync() {
 
   // Bootstrap a specific directory instance with its own state and configuration
   async function bootstrapInstance(directory: string) {
-    if (!directory) return
+    if (!directory) {
+      log.warn(`[bootstrapInstance] directory is empty`)
+      return
+    }
     // Check if bootstrapping is already in progress for this directory
     const pending = booting.get(directory)
+    log.info(`[bootstrapInstance] directory=${directory}, pending=${pending}`)
     if (pending) return pending
 
     // Pin directory to prevent disposal during bootstrapping
