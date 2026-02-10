@@ -58,7 +58,7 @@ function projectsKey(url: string) {
  */
 export const { use: useServer, provider: ServerProvider } = createSimpleContext({
   name: "Server",
-  init: (props: { defaultUrl: string }) => {
+  init: (props: { defaultUrl: string; isSidecar?: boolean }) => {
     const platform = usePlatform()
 
     // Create persisted store for server list and projects
@@ -67,6 +67,7 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       createStore({
         // List of known server URLs
         list: [] as string[],
+        currentSidecarUrl: "",
         // Projects per server
         projects: {} as Record<string, StoredProject[]>,
         // Last opened project per server
@@ -112,8 +113,14 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       // Don't add if it's the default server
       const fallback = normalizeServerUrl(props.defaultUrl)
       if (fallback && url === fallback) {
-        log.info(`[add][setState][active] url === fallback, input=${input}, url=${url}, fallback=${fallback}`)
-        setState("active", url)
+        batch(() => {
+          if (!store.list.includes(url)) {
+            // Add the fallback url to the list if it's not already in the list
+            setStore("list", store.list.length, url)
+          }
+          log.info(`[add][setState][active] url === fallback, input=${input}, url=${url}, fallback=${fallback}`)
+          setState("active", url)
+        })
         return
       }
 
@@ -158,9 +165,21 @@ export const { use: useServer, provider: ServerProvider } = createSimpleContext(
       if (state.active) return
       const url = normalizeServerUrl(props.defaultUrl)
       if (!url) return
+      batch(() => {
+        // Remove the previous startup sidecar url
+        if (store.currentSidecarUrl) {
+          remove(store.currentSidecarUrl)
+        }
 
-      log.info(`[createEffect][setState][active] url=${url}, defaultUrl=${props.defaultUrl}`)
-      setState("active", url)
+        // Add the new sidecar url
+        if (props.isSidecar && props.defaultUrl) {
+          add(props.defaultUrl)
+          setStore("currentSidecarUrl", props.defaultUrl)
+        }
+
+        log.info(`[createEffect][setState][active] url=${url}, defaultUrl=${props.defaultUrl}`)
+        setState("active", url)
+      })
     })
 
     /**
