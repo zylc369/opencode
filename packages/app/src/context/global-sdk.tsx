@@ -21,11 +21,20 @@ export const { use: useGlobalSDK, provider: GlobalSDKProvider } = createSimpleCo
     const platform = usePlatform()
     const abort = new AbortController()
 
+    const auth = (() => {
+      if (typeof window === "undefined") return
+      const password = window.__OPENCODE__?.serverPassword
+      if (!password) return
+      return {
+        Authorization: `Basic ${btoa(`opencode:${password}`)}`,
+      }
+    })()
+
     // Create SDK client for SSE connection (shared by all contexts)
     const eventSdk = createOpencodeClient({
       baseUrl: server.url,
       signal: abort.signal,
-      fetch: platform.fetch,
+      headers: auth,
     })
 
     // Global event emitter for distributing events to all listeners
