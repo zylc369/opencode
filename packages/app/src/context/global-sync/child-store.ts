@@ -14,6 +14,9 @@ import {
   type VcsCache,
 } from "./types"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./eviction"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "child-store" })
 
 /**
  * Create a child store manager for directory-specific state
@@ -282,6 +285,7 @@ export function createChildStoreManager(input: {
    * @param patch - Metadata patch to apply
    */
   function projectMeta(directory: string, patch: ProjectMeta) {
+    log.info(`[projectMeta] directory=${directory}, patch=${JSON.stringify(patch)}`)
     const [store, setStore] = ensureChild(directory)
     const cached = metaCache.get(directory)
     if (!cached) return
@@ -304,6 +308,7 @@ export function createChildStoreManager(input: {
    * @param value - Icon data URL or undefined to clear
    */
   function projectIcon(directory: string, value: string | undefined) {
+    log.info(`[projectMeta] directory=${directory}, value=${value}`)
     const [store, setStore] = ensureChild(directory)
     const cached = iconCache.get(directory)
     if (!cached) return

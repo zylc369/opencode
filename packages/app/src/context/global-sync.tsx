@@ -234,7 +234,10 @@ function createGlobalSync() {
     const promise = loadRootSessionsWithFallback({
       directory,
       limit,
-      list: (query) => globalSDK.client.session.list(query),
+      list: (query) => {
+        log.info(`[session][list] query=${JSON.stringify(query)}`)
+        return globalSDK.client.session.list(query)
+      },
       onFallback: () => {
         stats.loadSessionsFallback += 1
         updateStats(Object.keys(children.children).length)
@@ -324,6 +327,8 @@ function createGlobalSync() {
   const unsub = globalSDK.event.listen((e) => {
     const directory = e.name
     const event = e.details
+
+    log.info(`[event][listen] directory=${directory}, event=${JSON.stringify(event)}`)
 
     // Handle global events that affect the entire application
     if (directory === "global") {
@@ -425,6 +430,7 @@ function createGlobalSync() {
     // Global bootstrap function
     bootstrap,
     updateConfig: (config: Config) => {
+      log.info(`[updateConfig] config=${config}`)
       // Update global configuration with reload state management
       setGlobalStore("reload", "pending")
       return globalSDK.client.global.config.update({ config }).finally(() => {

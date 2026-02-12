@@ -15,6 +15,9 @@ import { getFilename } from "@opencode-ai/util/path"
 import { showToast } from "@opencode-ai/ui/toast"
 import { cmp, normalizeProviderList } from "./utils"
 import type { State, VcsCache } from "./types"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "bootstrap" })
 
 type GlobalStore = {
   ready: boolean
@@ -50,11 +53,13 @@ export async function bootstrapGlobal(input: {
   const tasks = [
     retry(() =>
       input.globalSDK.path.get().then((x) => {
+        log.info(`[path] data=${JSON.stringify(x.data)}`)
         input.setGlobalStore("path", x.data!)
       }),
     ),
     retry(() =>
       input.globalSDK.global.config.get().then((x) => {
+        log.info(`[global][config] data=${JSON.stringify(x.data)}`)
         input.setGlobalStore("config", x.data!)
       }),
     ),
@@ -65,16 +70,19 @@ export async function bootstrapGlobal(input: {
           .filter((p) => !!p.worktree && !p.worktree.includes("opencode-test"))
           .slice()
           .sort((a, b) => cmp(a.id, b.id))
+        log.info(`[project][list] data=${JSON.stringify(x.data)}`)
         input.setGlobalStore("project", projects)
       }),
     ),
     retry(() =>
       input.globalSDK.provider.list().then((x) => {
+        log.info(`[provider][list] data=${JSON.stringify(x.data)}`)
         input.setGlobalStore("provider", normalizeProviderList(x.data!))
       }),
     ),
     retry(() =>
       input.globalSDK.provider.auth().then((x) => {
+        log.info(`[provider][auth] data=${JSON.stringify(x.data)}`)
         input.setGlobalStore("provider_auth", x.data ?? {})
       }),
     ),
