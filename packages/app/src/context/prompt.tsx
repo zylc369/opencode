@@ -163,21 +163,24 @@ function createPromptSession(dir: string, id: string | undefined) {
       add(item: ContextItem) {
         const key = keyForItem(item)
         if (store.context.items.find((x) => x.key === key)) return
-        log.info(`[PromptSubmit][restoreCommentItems] key=${key}, item=${JSON.stringify(item)}`)
+        log.info(`[add][context][items] key=${key}, item=${JSON.stringify(item)}`)
         setStore("context", "items", (items) => [...items, { key, ...item }])
       },
       remove(key: string) {
+        log.info(`[remove][context][items] key=${key}`)
         setStore("context", "items", (items) => items.filter((x) => x.key !== key))
       },
     },
     set(prompt: Prompt, cursorPosition?: number) {
       const next = clonePrompt(prompt)
+      log.info(`[set][prompt|cursor] prompt=${JSON.stringify(next)}, cursorPosition=${cursorPosition}`)
       batch(() => {
         setStore("prompt", next)
         if (cursorPosition !== undefined) setStore("cursor", cursorPosition)
       })
     },
     reset() {
+      log.info(`[reset][prompt|cursor]`)
       batch(() => {
         setStore("prompt", clonePrompt(DEFAULT_PROMPT))
         setStore("cursor", 0)
@@ -231,7 +234,10 @@ export const { use: usePrompt, provider: PromptProvider } = createSimpleContext(
       return entry.value
     }
 
-    const session = createMemo(() => load(params.dir!, params.id))
+    const session = createMemo(() => {
+      log.info(`[usePrompt][init][session] dir=${params.dir}, id=${params.id}`)
+      return load(params.dir!, params.id)
+    })
 
     return {
       ready: () => session().ready(),

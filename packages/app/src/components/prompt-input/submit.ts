@@ -186,10 +186,19 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     // Get current input mode (normal or shell)
     const mode = input.mode()
 
+    log.info(
+      `[handleSubmit] mode=${mode}, imagesLength=${images.length}, partLength=${currentPrompt.length}, text=${text}`,
+    )
+
     // Early return if input is empty (no text, images, or comments)
     // If there's a working request, abort it before returning
     if (text.trim().length === 0 && images.length === 0 && input.commentCount() === 0) {
-      if (input.working()) abort()
+      if (input.working()) {
+        log.warn(`[handleSubmit] No any input. working, will abort`)
+        abort()
+      } else {
+        log.warn(`[handleSubmit] No any input`)
+      }
       return
     }
 
@@ -213,7 +222,12 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     // Check if this is a new session (no ID in params)
     const isNewSession = !params.id
     // Get selected worktree, default to "main"
-    const worktreeSelection = input.newSessionWorktree?.() || "main"
+    const newSessionWorktree = input.newSessionWorktree?.()
+    const worktreeSelection = newSessionWorktree || "main"
+
+    log.info(
+      `[handleSubmit] projectDirectory=${projectDirectory}, sessionID=${params.id}, isNewSession=${isNewSession}, newSessionWorktree=${newSessionWorktree}, worktreeSelection=${worktreeSelection}`,
+    )
 
     // Initialize session directory and client (may change for worktrees)
     let sessionDirectory = projectDirectory
@@ -224,6 +238,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       // Case 1: User selected to create a new worktree
       if (worktreeSelection === "create") {
         // Attempt to create a new worktree for this session
+        log.info("[handleSubmit][worktree][create] Attempt to create a new worktree for this session.")
         const createdWorktree = await client.worktree
           .create({ directory: projectDirectory })
           .then((x) => x.data)
@@ -244,6 +259,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           })
           return
         }
+        log.info(
+          `[handleSubmit][worktree][create] Mark worktree as pending preparation. createdWorktree=${JSON.stringify(createdWorktree)}.`,
+        )
+
         // Mark worktree as pending preparation
         WorktreeState.pending(createdWorktree.directory)
         sessionDirectory = createdWorktree.directory
@@ -251,12 +270,16 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
       // Case 2: User selected an existing worktree (not "main" and not "create")
       if (worktreeSelection !== "main" && worktreeSelection !== "create") {
+        log.info(`[handleSubmit][worktree] worktreeSelection=${worktreeSelection}.`)
         sessionDirectory = worktreeSelection
       }
 
       // If session directory differs from project directory, create a new client
       // This is needed for worktree-specific operations
       if (sessionDirectory !== projectDirectory) {
+        log.info(
+          `[handleSubmit][worktree] Session directory differs from project directory, create a new client. sessionDirectory=${sessionDirectory}`,
+        )
         client = createOpencodeClient({
           baseUrl: sdk.url,
           fetch: platform.fetch,
@@ -275,6 +298,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     let session = input.info()
     if (!session && isNewSession) {
       // Create new session via API
+      log.info(`[handleSubmit] Create new session via API. session=${session}, isNewSession=${isNewSession}`)
+
       session = await client.session
         .create()
         .then((x) => x.data ?? undefined)
@@ -287,6 +312,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         })
       // If session created successfully, navigate to it
       if (session) {
+        log.info(`[handleSubmit] Create new session via API, navigate to it. session=${session?.id}`)
+
         layout.handoff.setTabs(base64Encode(sessionDirectory), session.id)
         navigate(`/${base64Encode(sessionDirectory)}/session/${session.id}`)
       }
@@ -294,6 +321,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     // Abort if we don't have a valid session (creation failed)
     if (!session) {
+      log.error(`[handleSubmit] Abort we don't have a valid session (creation failed)`)
       showToast({
         title: language.t("prompt.toast.promptSendFailed.title"),
         description: language.t("prompt.toast.promptSendFailed.description"),
@@ -312,11 +340,14 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     const agent = currentAgent.name
     const variant = local.model.variant.current()
 
+    log.info(`[handleSubmit] model=${JSON.stringify(model)}, agent=${agent}, variant=${variant}`)
+
     /**
      * Clears the input field and resets UI state
      * Called after successful submission to prepare for next input
      */
     const clearInput = () => {
+      log.info("[handleSubmit][clearInput]")
       prompt.reset()
       input.setMode("normal")
       input.setPopover(null)
@@ -327,10 +358,13 @@ export function createPromptSubmit(input: PromptSubmitInput) {
      * Used after failed submission to allow user to retry without losing their input
      */
     const restoreInput = () => {
+      log.info("[handleSubmit][restoreInput]")
+
       prompt.set(currentPrompt, input.promptLength(currentPrompt))
       input.setMode(mode)
       input.setPopover(null)
       requestAnimationFrame(() => {
+        log.info("[handleSubmit][restoreInput][requestAnimationFrame]")
         const editor = input.editor()
         if (!editor) return
         editor.focus()
@@ -341,6 +375,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     // Handle shell mode: execute as a shell command
     if (mode === "shell") {
+      log.info("[handleSubmit][shell]")
       clearInput()
       client.session
         .shell({
@@ -362,6 +397,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
 
     // Handle custom slash commands (e.g., "/command args")
     if (text.startsWith("/")) {
+      log.info(`[handleSubmit] Handle custom slash commands. text=${text}`)
+
       // Parse command name and arguments
       const [cmdName, ...args] = text.split(" ")
       // Remove leading slash
@@ -430,24 +467,29 @@ export function createPromptSubmit(input: PromptSubmitInput) {
      * Adds optimistic message to sync store for immediate UI feedback
      * Shows user message immediately while waiting for server response
      */
-    const addOptimisticMessage = () =>
+    const addOptimisticMessage = () => {
+      log.info(`[handleSubmit][addOptimisticMessage]`)
+
       sync.session.optimistic.add({
         directory: sessionDirectory,
         sessionID: session.id,
         message: optimisticMessage,
         parts: optimisticParts,
       })
+    }
 
     /**
      * Removes optimistic message from sync store
      * Called when request fails or completes to clean up optimistic state
      */
-    const removeOptimisticMessage = () =>
+    const removeOptimisticMessage = () => {
+      log.info(`[handleSubmit][removeOptimisticMessage]`)
       sync.session.optimistic.remove({
         directory: sessionDirectory,
         sessionID: session.id,
         messageID,
       })
+    }
 
     // Prepare UI state: remove comments, clear input, show optimistic message
     removeCommentItems(commentItems)

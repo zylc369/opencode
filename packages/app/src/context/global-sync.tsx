@@ -328,7 +328,10 @@ function createGlobalSync() {
     const directory = e.name
     const event = e.details
 
-    log.info(`[event][listen] directory=${directory}, event=${JSON.stringify(event)}`)
+    if ((event.type as string) !== "server.heartbeat") {
+      // Do not print heartbeat
+      log.info(`[event][listen] directory=${directory}, event=${JSON.stringify(event)}`)
+    }
 
     // Handle global events that affect the entire application
     if (directory === "global") {
