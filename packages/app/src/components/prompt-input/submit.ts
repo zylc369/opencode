@@ -508,11 +508,23 @@ export function createPromptSubmit(input: PromptSubmitInput) {
      */
     const waitForWorktree = async () => {
       const worktree = WorktreeState.get(sessionDirectory)
+      log.info(
+        `[handleSubmit][waitForWorktree] sessionDirectory=${sessionDirectory}, worktree=${JSON.stringify(worktree)}`,
+      )
+
       // If worktree is not in pending state, we're ready to proceed
-      if (!worktree || worktree.status !== "pending") return true
+      if (!worktree || worktree.status !== "pending") {
+        log.info(
+          `[handleSubmit][waitForWorktree] Worktree is not in pending state, we're ready to proceed. sessionDirectory=${sessionDirectory}`,
+        )
+        return true
+      }
 
       // Set session to busy status while waiting for worktree preparation
       if (sessionDirectory === projectDirectory) {
+        log.info(
+          `[handleSubmit][waitForWorktree] Set session to busy status while waiting for worktree preparation. sessionDirectory=${sessionDirectory}`,
+        )
         sync.set("session_status", session.id, { type: "busy" })
       }
 
@@ -521,7 +533,10 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       // Define cleanup function to restore state on abort/failure
       const cleanup = () => {
         if (sessionDirectory === projectDirectory) {
+          log.info(`[handleSubmit][waitForWorktree][cleanup] Set session to idle. sessionDirectory=${sessionDirectory}`)
           sync.set("session_status", session.id, { type: "idle" })
+        } else {
+          log.info(`[handleSubmit][waitForWorktree][cleanup] sessionDirectory=${sessionDirectory}.`)
         }
         removeOptimisticMessage()
         restoreCommentItems(commentItems)

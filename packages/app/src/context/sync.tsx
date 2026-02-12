@@ -6,6 +6,9 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { useGlobalSync } from "./global-sync"
 import { useSDK } from "./sdk"
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "sync" })
 
 const keyFor = (directory: string, id: string) => `${directory}\n${id}`
 
@@ -150,6 +153,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         get: getSession,
         optimistic: {
           add(input: { directory?: string; sessionID: string; message: Message; parts: Part[] }) {
+            log.info(`[session][optimistic][add] input=${JSON.stringify(input)}`)
+
             const [, setStore] = target(input.directory)
             setStore(
               produce((draft) => {
@@ -158,6 +163,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             )
           },
           remove(input: { directory?: string; sessionID: string; messageID: string }) {
+            log.info(`[session][optimistic][remove] input=${JSON.stringify(input)}`)
+
             const [, setStore] = target(input.directory)
             setStore(
               produce((draft) => {
