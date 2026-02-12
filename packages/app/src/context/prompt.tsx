@@ -5,6 +5,9 @@ import { useParams } from "@solidjs/router"
 import type { FileSelection } from "@/context/file"
 import { Persist, persisted } from "@/utils/persist"
 import { checksum } from "@opencode-ai/util/encode"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "prompt" })
 
 interface PartBase {
   content: string
@@ -160,6 +163,7 @@ function createPromptSession(dir: string, id: string | undefined) {
       add(item: ContextItem) {
         const key = keyForItem(item)
         if (store.context.items.find((x) => x.key === key)) return
+        log.info(`[PromptSubmit][restoreCommentItems] key=${key}, item=${JSON.stringify(item)}`)
         setStore("context", "items", (items) => [...items, { key, ...item }])
       },
       remove(key: string) {
