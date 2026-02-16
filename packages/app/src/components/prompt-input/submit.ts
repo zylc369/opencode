@@ -194,7 +194,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     // If there's a working request, abort it before returning
     if (text.trim().length === 0 && images.length === 0 && input.commentCount() === 0) {
       if (input.working()) {
-        log.warn(`[handleSubmit] No any input. working, will abort`)
+        log.warn(`[handleSubmit] No any input, will abort`)
         abort()
       } else {
         log.warn(`[handleSubmit] No any input`)
