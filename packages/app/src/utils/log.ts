@@ -1,6 +1,3 @@
-import path from "path"
-import fs from "fs/promises"
-import { Global } from "../global"
 import z from "zod"
 
 export namespace Log {
@@ -46,47 +43,6 @@ export namespace Log {
     level?: Level
   }
 
-  let logpath = ""
-  export function file() {
-    return logpath
-  }
-  let write = (msg: any) => {
-    process.stderr.write(msg)
-    return msg.length
-  }
-
-  export async function init(options: Options) {
-    if (options.level) level = options.level
-    cleanup(Global.Path.log)
-    if (options.print) return
-    logpath = path.join(
-      Global.Path.log,
-      options.dev ? "dev.log" : new Date().toISOString().split(".")[0].replace(/:/g, "") + ".log",
-    )
-    const logfile = Bun.file(logpath)
-    await fs.truncate(logpath).catch(() => {})
-    const writer = logfile.writer()
-    write = async (msg: any) => {
-      const num = writer.write(msg)
-      writer.flush()
-      return num
-    }
-  }
-
-  async function cleanup(dir: string) {
-    const glob = new Bun.Glob("????-??-??T??????.log")
-    const files = await Array.fromAsync(
-      glob.scan({
-        cwd: dir,
-        absolute: true,
-      }),
-    )
-    if (files.length <= 5) return
-
-    const filesToDelete = files.slice(0, -10)
-    await Promise.all(filesToDelete.map((file) => fs.unlink(file).catch(() => {})))
-  }
-
   function formatError(error: Error, depth = 0): string {
     const result = error.message
     return error.cause instanceof Error && depth < 10
@@ -95,7 +51,7 @@ export namespace Log {
   }
 
   let last = Date.now()
-  export function create(tags?: Record<string, any>, tagsWithoutKey?: Record<string, any>) {
+  export function create(tags?: Record<string, any>) {
     tags = tags || {}
 
     const service = tags["service"]
@@ -140,36 +96,28 @@ export namespace Log {
       const next = new Date()
       const diff = next.getTime() - last
       last = next.getTime()
-      let tagsWithoutKeyFormatted = Object.values(tagsWithoutKey ? tagsWithoutKey : [])
-        .map((v) => `[${v}]`)
-        .join("")
-      if (tagsWithoutKeyFormatted !== "") {
-        tagsWithoutKeyFormatted = ` ${tagsWithoutKeyFormatted} `
-      } else {
-        tagsWithoutKeyFormatted = " "
-      }
-      return `${next.toISOString().split(".")[0]} ${("+" + diff + "ms").padStart(8)}${tagsWithoutKeyFormatted}[${prefix}] ${message}\n`
+      return `${next.toISOString().split(".")[0]} ${("+" + diff + "ms").padStart(6)} [${prefix}] ${message}\n`
     }
     const build = buildV2
     const result: Logger = {
       debug(message?: any, extra?: Record<string, any>) {
         if (shouldLog("DEBUG")) {
-          write("DEBUG " + build(message, extra))
+          console.debug(build(message, extra))
         }
       },
       info(message?: any, extra?: Record<string, any>) {
         if (shouldLog("INFO")) {
-          write("INFO  " + build(message, extra))
+          console.info(build(message, extra))
         }
       },
       error(message?: any, extra?: Record<string, any>) {
         if (shouldLog("ERROR")) {
-          write("ERROR " + build(message, extra))
+          console.error(build(message, extra))
         }
       },
       warn(message?: any, extra?: Record<string, any>) {
         if (shouldLog("WARN")) {
-          write("WARN  " + build(message, extra))
+          console.warn(build(message, extra))
         }
       },
       tag(key: string, value: string) {

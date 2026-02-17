@@ -40,6 +40,9 @@ import { QuestionRoutes } from "./routes/question"
 import { PermissionRoutes } from "./routes/permission"
 import { GlobalRoutes } from "./routes/global"
 import { MDNS } from "./mdns"
+import { Identifier } from "@/id/id"
+
+const CONTEXT_KEY_SERVER_LOG = "serverInstanceLog"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -54,12 +57,26 @@ export namespace Server {
     return _url ?? new URL("http://localhost:4096")
   }
 
-  const app = new Hono()
+  // 定义你的环境类型
+  type HonoAppEnv = {
+    Variables: {
+      serverInstanceLog: Log.Logger // ← 关键：声明 key 和类型
+    }
+  }
+
+  const app = new Hono<HonoAppEnv>()
   export const App: () => Hono = lazy(
     () =>
       // TODO: Break server.ts into smaller route files to fix type inference
       app
+        .use("*", async (c, next) => {
+          const traceId = Identifier.ascending("trace")
+          const log = Log.create({}, { serviceInst: "server", traceId, method: c.req.method, path: c.req.path })
+          c.set(CONTEXT_KEY_SERVER_LOG, log)
+          await next()
+        })
         .onError((err, c) => {
+          const log = c.get(CONTEXT_KEY_SERVER_LOG)
           log.error("failed", {
             error: err,
           })
@@ -72,7 +89,8 @@ export namespace Server {
             return c.json(err.toObject(), { status })
           }
           if (err instanceof HTTPException) return err.getResponse()
-          const message = err instanceof Error && err.stack ? err.stack : err.toString()
+          let message = err instanceof Error && err.stack ? err.stack : err.toString()
+          message += `|method=${c.req.method}, path=${c.req.path}, traceId=${c.res.headers.get("X-TRACE-ID")}`
           return c.json(new NamedError.Unknown({ message }).toObject(), {
             status: 500,
           })
@@ -87,7 +105,9 @@ export namespace Server {
           return basicAuth({ username, password })(c, next)
         })
         .use(async (c, next) => {
+          const log = c.get(CONTEXT_KEY_SERVER_LOG)
           const skipLogging = c.req.path === "/log"
+          const isPrintDetails = !skipLogging && c.req.path !== "/global/health"
           if (!skipLogging) {
             log.info("request", {
               method: c.req.method,
@@ -97,6 +117,7 @@ export namespace Server {
           const timer = log.time("request", {
             method: c.req.method,
             path: c.req.path,
+            raw: isPrintDetails ? JSON.stringify(c.req) : undefined,
           })
           await next()
           if (!skipLogging) {
@@ -500,6 +521,7 @@ export namespace Server {
             },
           }),
           async (c) => {
+            const log = c.get(CONTEXT_KEY_SERVER_LOG)
             log.info("event connected")
             return streamSSE(c, async (stream) => {
               stream.writeSSE({
@@ -539,7 +561,15 @@ export namespace Server {
           },
         )
         .all("/*", async (c) => {
+          const log = c.get(CONTEXT_KEY_SERVER_LOG)
           const path = c.req.path
+
+          // const timer = log.time("request", {
+          //   traceId: c.res.headers.get("X-TRACE-ID"),
+          //   method: c.req.method,
+          //   path: c.req.path,
+          // })
+          log.info(`[all]`)
 
           const response = await proxy(`https://app.opencode.ai${path}`, {
             ...c.req,

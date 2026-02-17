@@ -35,6 +35,9 @@ import { bootstrapDirectory, bootstrapGlobal } from "./global-sync/bootstrap"
 import { sanitizeProject } from "./global-sync/utils"
 import type { ProjectMeta } from "./global-sync/types"
 import { SESSION_RECENT_LIMIT } from "./global-sync/types"
+import { Log } from "@/utils/log"
+
+const log = Log.create({ service: "global-sync" })
 
 type GlobalStore = {
   ready: boolean
@@ -256,6 +259,11 @@ function createGlobalSync() {
   const unsub = globalSDK.event.listen((e) => {
     const directory = e.name
     const event = e.details
+
+    if ((event.type as string) !== "server.heartbeat") {
+      // Do not print heartbeat
+      log.info(`[event][listen] directory=${directory}, event=${JSON.stringify(event)}`)
+    }
 
     if (directory === "global") {
       applyGlobalEvent({
