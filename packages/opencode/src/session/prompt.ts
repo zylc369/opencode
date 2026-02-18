@@ -308,10 +308,12 @@ export namespace SessionPrompt {
 
       log.warn("loop aborted")
 
+      // 查找最后的用户消息和助手消息
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
       let lastFinished: MessageV2.Assistant | undefined
       let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
+      // 倒序遍历，可以快速找到最近的消息、收集最近的待处理任务（subtask/compaction）
       for (let i = msgs.length - 1; i >= 0; i--) {
         const msg = msgs[i]
         if (!lastUser && msg.info.role === "user") lastUser = msg.info as MessageV2.User
@@ -331,6 +333,7 @@ export namespace SessionPrompt {
         !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
         lastUser.id < lastAssistant.id
       ) {
+        // 模型已完成，退出循环
         log.info("exiting loop", { sessionID })
         break
       }

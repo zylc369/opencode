@@ -796,14 +796,18 @@ export namespace MessageV2 {
     const completed = new Set<string>()
     for await (const msg of stream) {
       result.push(msg)
+
+      // 如果是用户消息，且已完成压缩，且包含 compaction part，则停止，因为后续的消息都是压缩后的结果，不需要再处理了
       if (
         msg.info.role === "user" &&
         completed.has(msg.info.id) &&
         msg.parts.some((part) => part.type === "compaction")
       )
         break
+      // 如果是助手消息且已总结完成，标记其父消息为已完成，父消息即用户消息
       if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish) completed.add(msg.info.parentID)
     }
+    // 反转顺序，数据库是倒序查询的，但模型需要按时间正序处理（最早的在前）
     result.reverse()
     return result
   }
