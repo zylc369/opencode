@@ -1314,18 +1314,64 @@ if (result === "continue" && input.auto) {
 
 **"stop and ask for clarification" 如何工作？**
 
-这段文本是发送给**模型**的提示，不是给用户的。流程如下：
+这段文本**不是直接添加到提示词**，而是通过**插入一条合成的用户消息**到数据库，下轮循环读取后发送给模型。
+
+**添加位置**：`src/session/compaction.ts:202-224`
+
+```typescript
+if (result === "continue" && input.auto) {
+  // 1. 创建一条新的用户消息
+  const continueMsg = await Session.updateMessage({
+    id: Identifier.ascending("message"),
+    role: "user",
+    sessionID: input.sessionID,
+    agent: userMessage.agent,
+    model: userMessage.model,
+  })
+
+  // 2. 创建一个 text part，标记为合成消息
+  await Session.updatePart({
+    messageID: continueMsg.id,
+    type: "text",
+    synthetic: true,  // ← 标记为合成消息（不是用户真实输入）
+    text: "Continue if you have next steps, or stop and ask for clarification...",
+  })
+}
+```
+
+**完整数据流程**：
 
 ```
-1. compaction 完成后，loop 继续循环
-2. filterCompacted 读取消息，在 summary: true 的助手消息处截断
-3. 新一轮处理时，模型看到：
-   - 压缩摘要（summary 消息）
-   - "Continue if you have next steps..." 提示
-4. 模型根据提示决定：
-   - 继续执行下一步
-   - 或停下来询问用户（通过 question 工具或直接 finish: "stop"）
+compaction 完成摘要生成 (result === "continue")
+    ↓
+创建合成用户消息，内容是 "Continue if you have next steps..."
+    ↓
+持久化到数据库 (MessageTable + PartTable)
+    ↓
+下一轮 loop 循环
+    ↓
+MessageV2.filterCompacted() 读取消息历史
+    ↓
+包含这条合成消息
+    ↓
+MessageV2.toModelMessages() 转换
+    ↓
+发送给模型
 ```
+
+**模型看到的对话历史**：
+
+```json
+[
+  { "role": "user", "content": [...] },           // 触发压缩的用户消息（有 compaction part）
+  { "role": "assistant", "content": "## Goal\n..." },  // 压缩摘要（summary: true）
+  { "role": "user", "content": "Continue if you have next steps, or stop and ask for clarification..." }  // 合成消息
+]
+```
+
+**模型根据提示决定**：
+- 继续执行下一步
+- 或停下来询问用户（通过 question 工具或直接 `finish: "stop"`）
 
 **不是强制暂停**，而是让模型自己判断是否需要用户确认。
 
@@ -1467,6 +1513,45 @@ if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish)
 - **`finish`**：确保模型已经完成摘要生成（不是中断的）
 
 两个条件都满足，才认为这个压缩点是有效的，可以截断历史。
+
+**`finish` 字段何时被设置？**
+
+**位置**：`src/session/processor.ts:250`
+
+```typescript
+case "finish-step":
+  // ...
+  input.assistantMessage.finish = value.finishReason  // ← 从 AI SDK 获取
+  // ...
+  await Session.updateMessage(input.assistantMessage)  // 持久化到数据库
+```
+
+**数据流程**：
+
+```
+模型 API 响应
+    ↓
+AI SDK (streamText) 返回 finishReason
+    ↓
+finish-step 事件触发
+    ↓
+processor.process() 处理
+    ↓
+assistantMessage.finish = value.finishReason
+    ↓
+Session.updateMessage() 持久化
+```
+
+**finishReason 的可能值**：
+
+| 值 | 含义 |
+|---|------|
+| `"stop"` | 正常结束（没有工具调用） |
+| `"tool-calls"` | 模型调用了工具 |
+| `"length"` | 达到最大 token 限制 |
+| `"content-filter"` | 内容被过滤 |
+
+所以 `finish` 是在**模型完成响应时**由 API 返回并设置的，表示模型结束的原因。对于 compaction，通常 `finish` 值为 `"stop"`。
 
 ### 7.6 完整的 Compaction 流程图
 
