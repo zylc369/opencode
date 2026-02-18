@@ -2714,20 +2714,93 @@ abortSignal: input.abort,
 
 ```typescript
 headers: {
-  // OpenCode 内部提供商
+  // 1. OpenCode 内部提供商
   ...(input.model.providerID.startsWith("opencode") ? {
     "x-opencode-project": Instance.project.id,
     "x-opencode-session": input.sessionID,
     "x-opencode-request": input.user.id,
     "x-opencode-client": Flag.OPENCODE_CLIENT,
-  } : input.model.providerID !== "anthropic" ? {
-    // 其他提供商
+  } :
+  // 2. 其他提供商（非 Anthropic）
+  input.model.providerID !== "anthropic" ? {
     "User-Agent": `opencode/${Installation.VERSION}`,
-  } : undefined),
-  ...input.model.headers,  // 模型配置中的自定义头
-  ...headers,              // 插件注入的头
-},
+  } :
+  // 3. Anthropic 官方：不添加额外头
+  undefined),
+
+  // 4. 模型配置中的自定义头
+  ...input.model.headers,
+
+  // 5. 插件注入的头
+  ...headers,
+}
 ```
+
+**headers 的五个来源**：
+
+| 来源 | 说明 | 添加条件 |
+|------|------|---------|
+| OpenCode 内部头 | 项目/会话/请求标识 | providerID 以 "opencode" 开头 |
+| User-Agent | 客户端标识 | 非 OpenCode 且非 Anthropic |
+| 模型配置头 | 用户自定义头 | 配置文件中定义 |
+| 插件注入头 | 插件动态添加 | 插件触发时 |
+
+**1. OpenCode 内部提供商请求头**：
+
+| 请求头 | 值 | 用途 |
+|-------|-----|------|
+| `x-opencode-project` | 项目 ID | 标识当前项目，用于服务端识别和计费 |
+| `x-opencode-session` | 会话 ID | 标识当前会话，用于追踪和日志关联 |
+| `x-opencode-request` | 用户消息 ID | 标识当前请求，用于追踪单次请求 |
+| `x-opencode-client` | 客户端类型 | 标识客户端（CLI、VSCode 扩展等） |
+
+**用途**：OpenCode 代理服务器需要这些信息做请求追踪、项目统计、计费管理。
+
+**2. User-Agent（第三方提供商）**：
+
+```typescript
+"User-Agent": `opencode/${Installation.VERSION}`  // 如 "opencode/1.2.3"
+```
+
+**用途**：让第三方 API（OpenAI、Google 等）知道请求来自 OpenCode，用于统计和问题排查。
+
+**3. Anthropic 官方提供商**：
+
+不添加任何额外的 User-Agent 头，因为 Anthropic SDK 已经有自己的 User-Agent，避免冲突。
+
+**4. 模型配置中的自定义头**：
+
+用户可以在配置文件中为特定模型定义自定义请求头：
+
+```json
+{
+  "models": {
+    "my-custom-model": {
+      "providerID": "openai",
+      "modelID": "gpt-4",
+      "headers": {
+        "X-Custom-Header": "custom-value",
+        "X-API-Version": "v2"
+      }
+    }
+  }
+}
+```
+
+**5. 插件注入的头**：
+
+通过 `Plugin.trigger("chat.headers", ...)` 由插件动态注入：
+
+```typescript
+// llm.ts:137-149
+const { headers } = await Plugin.trigger(
+  "chat.headers",
+  { sessionID, agent, model, provider, message },
+  { headers: {} },  // 默认空对象，插件可以添加
+)
+```
+
+**用途**：插件可以动态添加认证信息、追踪 ID、A/B 测试标记等。
 
 **7. experimental_telemetry（遥测）**
 
@@ -2743,13 +2816,429 @@ experimental_telemetry: {
 
 用途：OpenTelemetry 遥测配置，用于追踪和监控 API 调用。
 
-### 10.4 实际 API 调用
+### 10.4 streamText 详解
 
-`streamText` 来自 `@ai-sdk/*` 包，它会：
-1. 根据 provider 配置选择正确的 SDK
-2. 构建请求体
-3. 发起 HTTP 请求
-4. 返回流式响应
+`streamText` 是 **Vercel AI SDK** 的核心函数，用于**流式调用大模型 API**。
+
+#### 10.4.1 streamText 返回值
+
+返回 `StreamTextResult` 对象：
+
+```typescript
+interface StreamTextResult {
+  // 流式事件（统一格式）- 立即可用
+  fullStream: AsyncIterable<StreamPart>
+
+  // 完整文本（Promise，流结束后可用）
+  text: Promise<string>
+
+  // Token 使用量（Promise，流结束后可用）
+  usage: Promise<Usage>
+
+  // 工具调用列表（Promise，流结束后可用）
+  toolCalls: Promise<ToolCall[]>
+
+  // 工具结果列表（Promise，流结束后可用）
+  toolResults: Promise<ToolResult[]>
+
+  // 是否有工具调用（Promise）
+  hasToolCalls: Promise<boolean>
+
+  // 请求 ID
+  requestId: Promise<string>
+}
+```
+
+#### 10.4.2 fullStream 事件类型
+
+`fullStream` 是统一格式的事件流，OpenCode 处理的事件类型：
+
+| 事件类型 | 含义 | OpenCode 处理 |
+|---------|------|--------------|
+| `start` | 流开始 | 设置会话状态为 "busy" |
+| `text-start` | 文本块开始 | 创建文本 part |
+| `text-delta` | 文本增量 | 增量更新文本到数据库 |
+| `text-end` | 文本块结束 | 完成文本 part |
+| `reasoning-start` | 推理块开始（如 Claude thinking） | 创建推理 part |
+| `reasoning-delta` | 推理增量 | 增量更新推理文本 |
+| `reasoning-end` | 推理块结束 | 完成推理 part |
+| `tool-input-start` | 工具输入开始 | 创建工具 part（pending 状态） |
+| `tool-input-delta` | 工具输入增量 | - |
+| `tool-input-end` | 工具输入结束 | - |
+| `tool-call` | 工具调用完成 | 执行工具，更新状态为 running |
+| `tool-result` | 工具执行结果 | 保存工具执行结果 |
+| `finish-step` | 步骤完成 | 保存 usage、finishReason |
+| `error` | 错误 | 处理错误，记录日志 |
+
+#### 10.4.3 streamText 的工作流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    streamText() 调用                        │
+├─────────────────────────────────────────────────────────────┤
+│  1. 参数处理                                                 │
+│     - 合并 system + messages                                │
+│     - 准备工具定义                                           │
+│     - 设置生成参数（temperature 等）                         │
+├─────────────────────────────────────────────────────────────┤
+│  2. 调用 Provider SDK                                        │
+│     - 选择对应的 SDK (@ai-sdk/anthropic 等)                  │
+│     - 构建请求体（适配提供商格式）                            │
+│     - 发起 HTTP 流式请求                                     │
+├─────────────────────────────────────────────────────────────┤
+│  3. 接收流式响应                                             │
+│     - 解析 SSE/流式数据                                      │
+│     - 转换为统一格式事件                                      │
+│     - 通过 fullStream 暴露                                  │
+├─────────────────────────────────────────────────────────────┤
+│  4. 返回 StreamTextResult                                    │
+│     - fullStream: 立即可用                                   │
+│     - text/usage/toolCalls: Promise（流结束后 resolve）      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 10.4.4 OpenCode 如何使用 streamText
+
+**位置**：`src/session/processor.ts:53-55`
+
+```typescript
+const stream = await LLM.stream(streamInput)
+
+for await (const value of stream.fullStream) {
+  // 实时处理每个事件
+  switch (value.type) {
+    case "text-delta":
+      // 增量更新文本到数据库
+      await Session.updatePartDelta({
+        sessionID, messageID, partID,
+        field: "text",
+        delta: value.text,
+      })
+    case "tool-call":
+      // 执行工具调用，更新状态到数据库
+    // ...
+  }
+}
+```
+
+#### 10.4.5 streamText vs generateText
+
+| 函数 | 特点 | 适用场景 |
+|------|------|---------|
+| `streamText` | 流式返回，实时获取内容 | 对话、实时显示、长响应 |
+| `generateText` | 等待完成后返回完整结果 | 单次任务、不需要实时 |
+
+#### 10.4.6 为什么选择 streamText？
+
+1. **实时反馈**：用户可以立即看到模型生成的内容
+2. **更好的用户体验**：不需要等待完整响应
+3. **支持长响应**：可以处理长时间生成的内容
+4. **支持中断**：用户可以随时取消（通过 abortSignal）
+5. **工具调用流式化**：可以看到工具调用的进度
+
+### 10.5 多平台模型适配
+
+OpenCode 通过 **`ProviderTransform`** 和 **AI SDK 架构** 适配多个平台的模型。
+
+#### 10.5.1 适配架构
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           OpenCode 统一接口                               │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          1. 模型元数据适配                                │
+│  - 模型 ID、上下文限制、能力声明、价格                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          2. 认证适配                                      │
+│  - API Key 格式、认证方式、请求头                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          3. 请求适配                                      │
+│  - 请求体格式、消息格式、工具定义、生成参数、端点 URL                       │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          4. 响应适配                                      │
+│  - 响应格式、流式格式、错误码、Token 统计、finish_reason                   │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          5. 功能适配                                      │
+│  - 工具调用、推理/thinking、缓存、多模态                                   │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          6. 行为适配                                      │
+│  - 默认参数、错误处理、重试策略、限流                                      │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 10.5.2 模型元数据适配
+
+**位置**：`src/provider/provider.ts:717-737`，数据来源：`models.dev`
+
+| 适配项 | 说明 | 示例差异 |
+|-------|------|---------|
+| **模型 ID** | 不同提供商的命名规则 | `claude-3-opus` vs `gpt-4-turbo` |
+| **上下文限制** | 输入/输出 token 限制 | Claude 200K vs GPT-4 128K |
+| **输入类型** | 支持的输入格式 | 文本、图像、音频、视频、PDF |
+| **输出类型** | 支持的输出格式 | 文本、图像 |
+| **功能支持** | 工具调用、推理、缓存 | `toolcall: true/false` |
+| **温度支持** | 是否支持 temperature | `capabilities.temperature` |
+| **推理支持** | 是否支持 thinking | `capabilities.reasoning` |
+
+```typescript
+// 模型能力定义
+capabilities: {
+  temperature: boolean,
+  reasoning: boolean,
+  attachment: boolean,
+  toolcall: boolean,
+  input: { text, audio, image, video, pdf },
+  output: { text, audio, image, video, pdf },
+  interleaved: { field: string } | false,
+}
+```
+
+#### 10.5.3 认证适配
+
+| 适配项 | 说明 | 示例差异 |
+|-------|------|---------|
+| **API Key 格式** | Key 的格式和长度 | Anthropic `sk-ant-...` vs OpenAI `sk-...` |
+| **认证方式** | Bearer token / OAuth / 自定义 | GitHub Copilot 使用 OAuth |
+| **认证头位置** | Header 名 | `Authorization` vs `X-API-Key` |
+| **额外认证** | 需要的额外 header | `anthropic-version` |
+
+#### 10.5.4 请求适配
+
+**消息格式适配**（`src/provider/transform.ts:47-172`）：
+
+| 适配项 | 说明 | OpenCode 处理 |
+|-------|------|--------------|
+| **空消息过滤** | Anthropic 拒绝空消息 | 过滤 `content === ""` 的消息 |
+| **toolCallId 格式** | ID 字符限制 | Claude: `a-zA-Z0-9_-`，Mistral: 9位字母数字 |
+| **推理内容位置** | thinking 放在哪里 | `reasoning_content` vs `reasoning` 字段 |
+| **消息顺序限制** | tool 消息后不能跟 user | Mistral 需要插入 "Done." 消息 |
+
+```typescript
+// 不同模型的 toolCallId 适配
+if (model.api.id.includes("claude")) {
+  toolCallId = toolCallId.replace(/[^a-zA-Z0-9_-]/g, "_")
+}
+if (model.api.id.includes("mistral")) {
+  toolCallId = toolCallId.replace(/[^a-zA-Z0-9]/g, "").substring(0, 9).padEnd(9, "0")
+}
+```
+
+**生成参数适配**（`src/provider/transform.ts:292-327`）：
+
+| 模型 | temperature | topP | topK |
+|------|-------------|------|------|
+| qwen | 0.55 | 1 | - |
+| claude | - | - | - |
+| gemini | 1.0 | 0.95 | 64 |
+| minimax | - | 0.95 | 40 |
+
+#### 10.5.5 响应适配
+
+**错误响应适配**（`src/provider/error.ts:8-39`）：
+
+```typescript
+// 不同提供商的溢出错误模式
+const OVERFLOW_PATTERNS = [
+  /prompt is too long/i,                     // Anthropic
+  /exceeds the context window/i,             // OpenAI
+  /input token count.*exceeds the maximum/i, // Google
+  /maximum context length is \d+ tokens/i,   // OpenRouter, DeepSeek
+  /context_window_exceeds_limit/i,           // MiniMax
+  /exceeded model token limit/i,             // Kimi, Moonshot
+]
+```
+
+**finish_reason 适配**：
+
+| 提供商 | 正常结束 | 工具调用 | 长度限制 |
+|-------|---------|---------|---------|
+| Anthropic | `end_turn` | `tool_use` | `max_tokens` |
+| OpenAI | `stop` | `tool_calls` | `length` |
+| 统一格式 | `stop` | `tool-calls` | `length` |
+
+#### 10.5.6 功能适配
+
+**推理/Thinking 配置**（`src/provider/transform.ts:332-811`）：
+
+```typescript
+export function variants(model: Provider.Model) {
+  switch (model.api.npm) {
+    // OpenAI
+    case "@ai-sdk/openai":
+      return {
+        low: { reasoningEffort: "low", reasoningSummary: "auto" },
+        high: { reasoningEffort: "high", reasoningSummary: "auto" },
+      }
+
+    // Anthropic
+    case "@ai-sdk/anthropic":
+      return {
+        high: { thinking: { type: "enabled", budgetTokens: 16000 } },
+        max: { thinking: { type: "enabled", budgetTokens: 31999 } },
+      }
+
+    // AWS Bedrock
+    case "@ai-sdk/amazon-bedrock":
+      return {
+        high: { reasoningConfig: { type: "enabled", budgetTokens: 16000 } },
+        max: { reasoningConfig: { type: "enabled", budgetTokens: 31999 } },
+      }
+
+    // Google
+    case "@ai-sdk/google":
+      return {
+        high: { thinkingConfig: { includeThoughts: true, thinkingBudget: 16000 } },
+        max: { thinkingConfig: { includeThoughts: true, thinkingBudget: 24576 } },
+      }
+
+    // Groq
+    case "@ai-sdk/groq":
+      return {
+        low: { includeThoughts: true, thinkingLevel: "low" },
+        high: { includeThoughts: true, thinkingLevel: "high" },
+      }
+  }
+}
+```
+
+**缓存配置**（`src/provider/transform.ts:174-212`）：
+
+```typescript
+const providerOptions = {
+  anthropic: { cacheControl: { type: "ephemeral" } },
+  bedrock: { cachePoint: { type: "default" } },
+  openaiCompatible: { cache_control: { type: "ephemeral" } },
+  copilot: { copilot_cache_control: { type: "ephemeral" } },
+}
+
+// 放置位置也不同
+const useMessageLevelOptions = model.providerID === "anthropic" || model.providerID.includes("bedrock")
+const shouldUseContentOptions = !useMessageLevelOptions && Array.isArray(msg.content)
+
+if (shouldUseContentOptions) {
+  // 内容级别（OpenRouter 等）
+  lastContent.providerOptions = mergeDeep(lastContent.providerOptions, providerOptions)
+} else {
+  // 消息级别（Anthropic 等）
+  msg.providerOptions = mergeDeep(msg.providerOptions, providerOptions)
+}
+```
+
+#### 10.5.7 其他重要适配
+
+**providerOptions 键名映射**（`src/provider/transform.ts:24-45, 267-287`）：
+
+```typescript
+// 不同 SDK 期望的键名
+function sdkKey(npm: string) {
+  switch (npm) {
+    case "@ai-sdk/github-copilot": return "copilot"
+    case "@ai-sdk/openai": return "openai"
+    case "@ai-sdk/amazon-bedrock": return "bedrock"
+    case "@ai-sdk/anthropic": return "anthropic"
+    case "@ai-sdk/google": return "google"
+    case "@ai-sdk/gateway": return "gateway"
+    case "@openrouter/ai-sdk-provider": return "openrouter"
+  }
+}
+
+// 重映射键名：存储的 providerID → SDK 期望的 key
+if (key !== model.providerID) {
+  msg.providerOptions[key] = msg.providerOptions[model.providerID]
+  delete msg.providerOptions[model.providerID]
+}
+```
+
+**不支持的输入类型处理**（`src/provider/transform.ts:214-250`）：
+
+```typescript
+// 检查模型是否支持某种输入类型
+const mime = part.type === "image" ? part.image.toString().split(";")[0].replace("data:", "") : part.mediaType
+const modality = mimeToModality(mime)  // image/audio/video/pdf
+if (!model.capabilities.input[modality]) {
+  return {
+    type: "text",
+    text: `ERROR: Cannot read ${name} (this model does not support ${modality} input).`,
+  }
+}
+```
+
+**提供商特定选项**（`src/provider/transform.ts:660-776`）：
+
+```typescript
+export function options(input: { model, sessionID, providerOptions }) {
+  const result = {}
+
+  // OpenAI: 默认禁用存储
+  if (model.providerID === "openai" || model.api.npm === "@ai-sdk/openai") {
+    result["store"] = false
+  }
+
+  // Anthropic: 启用 token 高效工具使用
+  if (model.api.npm === "@ai-sdk/anthropic") {
+    result["tokenEfficientTools"] = true
+  }
+
+  // Gateway: 自动缓存
+  if (model.api.npm === "@ai-sdk/gateway") {
+    result["gateway"] = { caching: "auto" }
+  }
+
+  return result
+}
+```
+
+**JSON Schema 适配**（`src/provider/transform.ts:858-929`）：
+
+```typescript
+// Google/Gemini: 整数枚举转字符串枚举
+if (model.providerID === "google" || model.api.id.includes("gemini")) {
+  const sanitizeGemini = (obj) => {
+    if (obj.enum && Array.isArray(obj.enum)) {
+      obj.enum = obj.enum.map((v) => String(v))  // 整数转字符串
+      if (obj.type === "integer") obj.type = "string"
+    }
+    // 非对象类型不能有 properties/required（Gemini 拒绝）
+    if (obj.type && obj.type !== "object") {
+      delete obj.properties
+      delete obj.required
+    }
+    return obj
+  }
+  schema = sanitizeGemini(schema)
+}
+```
+
+#### 10.5.8 适配点总表
+
+| 层级 | 适配项 | 代码位置 |
+|------|-------|---------|
+| **模型元数据** | ID、限制、能力 | `provider.ts:717-737` |
+| **消息格式** | 空消息、toolCallId、顺序 | `transform.ts:47-172` |
+| **缓存** | 格式、位置 | `transform.ts:174-212` |
+| **输入类型** | 不支持的类型处理 | `transform.ts:214-250` |
+| **键名映射** | providerID → SDK key | `transform.ts:24-45, 267-287` |
+| **生成参数** | temperature/topP/topK | `transform.ts:292-327` |
+| **推理配置** | thinking/reasoning 格式 | `transform.ts:332-811` |
+| **提供商选项** | store、caching 等 | `transform.ts:660-776` |
+| **JSON Schema** | 整数枚举、字段过滤 | `transform.ts:858-929` |
+| **错误响应** | 溢出检测、错误消息 | `error.ts:8-80` |
+| **请求头** | User-Agent、认证头 | `llm.ts:212-227` |
+| **请求体** | JSON 结构 | `@ai-sdk/*` 包内部 |
+| **响应体** | 格式转换 | `@ai-sdk/*` 包内部 |
+| **适配项总计** | | **70+** |
 
 ---
 
