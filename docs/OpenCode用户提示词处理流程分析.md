@@ -510,10 +510,269 @@ for (let i = msgs.length - 1; i >= 0; i--) {
 }
 ```
 
+#### 4.4.1 变量含义和后续用途
+
+| 变量 | 含义 | 后续用途 |
+|------|------|---------|
+| `lastUser` | 最后一条用户消息 | 1. 获取 `agent`、`model` 配置<br>2. 作为 `processor.process()` 的 `user` 参数<br>3. 创建 compaction 时需要这些信息 |
+| `lastAssistant` | 最后一条助手消息 | 1. 判断模型是否已完成响应（通过 `finish` 字段）<br>2. 退出循环的判断条件 |
+| `lastFinished` | 最后一条**已完成**的助手消息（有 `finish` 字段） | 1. 获取 `tokens` 统计信息<br>2. 判断是否触发压缩（`isOverflow` 需要 tokens）<br>3. 压缩点有效性判断（`summary && finish`） |
+| `tasks` | 待处理的 compaction/subtask parts | 1. 后续取出最新的 task 进行处理<br>2. 通过 `task.type` 判断处理逻辑 |
+
+**为什么需要区分 lastAssistant 和 lastFinished？**
+
+```typescript
+// lastAssistant：只要最后一条助手消息
+if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info
+
+// lastFinished：需要已完成（有 finish 字段）
+if (!lastFinished && msg.info.role === "assistant" && msg.info.finish) lastFinished = msg.info
+```
+
+- `lastAssistant` 可能**没有 finish**（正在生成中、被中断等）
+- `lastFinished` 一定有 `finish`，所以有 `tokens` 统计，可以用于判断是否需要压缩
+
+#### 4.4.2 compaction part 的产生和作用
+
+**什么时候产生 compaction part？**
+
+通过 `SessionCompaction.create` 创建，有两种触发方式：
+
+| 方式 | 触发位置 | `auto` 值 | 触发条件 |
+|------|---------|----------|---------|
+| 自动压缩 | `prompt.ts:561` 或 `prompt.ts:721` | `true` | token 溢出（`isOverflow` 返回 true） |
+| 手动压缩 | `session.ts:530` | `false`（默认） | 用户调用 `/compact` 命令或 API |
+
+**compaction part 的作用是什么？**
+
+compaction part 是一个**标记/信号**，告诉 loop 循环"这里需要执行压缩操作"。
+
+**完整流程**：
+```
+SessionCompaction.create()
+    → 插入 compaction part 到数据库
+    → continue 跳过本轮
+    → 下轮循环读取消息
+    → 检测到 compaction part
+    → 调用 SessionCompaction.process() 生成摘要
+```
+
+#### 4.4.3 tasks 的设计思路
+
+**为什么只存 part，不存 message？**
+
+```typescript
+const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
+if (task && !lastFinished) {
+  tasks.push(...task)  // 存的是 part，不是 msg
+}
+```
+
+**原因**：
+
+1. **part 包含处理所需的所有信息**：
+   ```typescript
+   // part 结构
+   {
+     type: "compaction" | "subtask",
+     auto: boolean,        // 是否自动触发
+     messageID: string,    // 可以找到对应的 message
+     sessionID: string,    // 可以找到对应的 session
+     // ... 其他字段
+   }
+   ```
+
+2. **process 函数通过其他参数获取 message**：
+   ```typescript
+   SessionCompaction.process({
+     messages: msgs,        // ← 完整消息历史已经传入
+     parentID: lastUser.id, // ← 触发压缩的用户消息 ID
+     auto: task.auto,       // ← 只需要 part 中的这个字段
+   })
+   ```
+
+3. **避免数据冗余**：`msgs` 数组已经包含了所有 message 数据，不需要再存储一份
+
+**tasks 后续如何使用？**
+
+```typescript
+const task = tasks.pop()  // 取最新一个待处理任务
+
+if (task?.type === "compaction") {
+  // 处理压缩任务
+  await SessionCompaction.process({ auto: task.auto, ... })
+}
+
+if (task?.type === "subtask") {
+  // 处理子任务
+  // ...
+}
+```
+
+**设计思路**：tasks 是一个**待处理任务队列**，按时间倒序收集，然后用 `pop()` 取出最新的一个进行处理。
+
+#### 4.4.4 为什么倒序遍历
+
 **原因**:
 - 倒序遍历可以快速找到最近的消息
 - 找到 `lastUser` 和 `lastFinished` 后立即 `break`，提高效率
 - 收集最近的待处理任务（subtask/compaction）
+
+#### 4.4.5 没有待处理任务时的流程
+
+**如果没有 compaction 或 subtask 类型的 part**：
+
+`tasks` 数组为空，`tasks.pop()` 返回 `undefined`，直接进入 normal processing：
+
+```typescript
+const task = tasks.pop()  // 返回 undefined
+
+if (task?.type === "subtask") {
+  // 不进入
+}
+
+if (task?.type === "compaction") {
+  // 不进入
+}
+
+// context overflow - 需要 lastFinished 存在才会触发
+if (lastFinished && lastFinished.summary !== true && isOverflow(...)) {
+  // 如果 lastFinished 不存在，不进入
+}
+
+// normal processing - 直接进入这里
+const agent = await Agent.get(lastUser.agent)
+const processor = SessionProcessor.create({...})
+// ... 调用 processor.process() → 大模型 API
+```
+
+**流程图**：
+
+```
+没有 compaction/subtask part
+    ↓
+task = undefined
+    ↓
+跳过 subtask 处理
+    ↓
+跳过 compaction 处理
+    ↓
+检查是否需要自动压缩（需要 lastFinished 存在）
+    ↓
+进入 normal processing
+    ↓
+调用 processor.process() → 大模型 API
+```
+
+#### 4.4.6 有 lastAssistant 但没有 lastFinished 的情况
+
+**什么情况下会发生？**
+
+| 情况 | 说明 |
+|------|------|
+| 正在生成中 | 助手消息刚开始创建，还没有完成，`finish` 字段尚未设置 |
+| 被中断 | 用户取消了请求，助手消息没有正常完成 |
+| 出错 | API 调用失败，没有生成完整的响应 |
+
+**代码判断逻辑**：
+
+```typescript
+// lastAssistant：只要有助手消息就设置
+if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info
+
+// lastFinished：需要有 finish 字段才设置
+if (!lastFinished && msg.info.role === "assistant" && msg.info.finish)
+  lastFinished = msg.info
+```
+
+**这种情况下的处理**：
+
+```typescript
+// 1. 退出循环检查 - lastAssistant.finish 不存在，不会退出
+if (lastAssistant?.finish && ...) {
+  break  // 不进入，继续循环
+}
+
+// 2. 自动压缩检查 - lastFinished 不存在，不会触发
+if (lastFinished && lastFinished.summary !== true && isOverflow(...)) {
+  await SessionCompaction.create(...)  // 不进入
+}
+
+// 3. 直接进入 normal processing，继续生成响应
+```
+
+**总结**：有 `lastAssistant` 但没有 `lastFinished` 时：
+- 不会退出循环
+- 不会触发自动压缩
+- 直接进入 normal processing，让模型继续生成/补全响应
+
+**未完成的 part 数据如何处理？**
+
+进入 normal processing 时，会带着未完成助手消息的 part 数据调用大模型 API，但有特殊处理：
+
+**位置**：`src/session/message-v2.ts:606-670`
+
+```typescript
+for (const part of msg.parts) {
+  if (part.type === "text")
+    assistantMessage.parts.push({ type: "text", text: part.text })
+
+  if (part.type === "tool") {
+    if (part.state.status === "completed") {
+      // 已完成的工具调用 → 正常输出
+      assistantMessage.parts.push({
+        type: ("tool-" + part.tool),
+        state: "output-available",
+        input: part.state.input,
+        output: part.state.output,
+      })
+    }
+
+    // ★ 关键：未完成的工具调用 → 标记为中断
+    if (part.state.status === "pending" || part.state.status === "running")
+      assistantMessage.parts.push({
+        type: ("tool-" + part.tool),
+        state: "output-error",
+        input: part.state.input,
+        errorText: "[Tool execution was interrupted]",  // ← 特殊标记
+      })
+  }
+}
+```
+
+**处理逻辑**：
+
+| part 状态 | 处理方式 |
+|----------|---------|
+| `completed` | 正常输出，包含 input 和 output |
+| `error` | 输出错误信息 |
+| `pending` / `running` | 输出 `"[Tool execution was interrupted]"` |
+
+**为什么这样处理？**
+
+```typescript
+// Handle pending/running tool calls to prevent dangling tool_use blocks
+// Anthropic/Claude APIs require every tool_use to have a corresponding tool_result
+```
+
+**原因**：Anthropic API 要求每个 `tool_use` 都有对应的 `tool_result`。如果之前的工具调用没有完成，必须提供一个"假"的结果，否则 API 会报错。
+
+**完整流程**：
+
+```
+有 lastAssistant 但没有 lastFinished
+    ↓
+msgs 包含未完成的助手消息（有 parts，无 finish）
+    ↓
+toModelMessages() 转换：
+  - text parts → 正常包含
+  - completed tools → 正常输出
+  - pending/running tools → "[Tool execution was interrupted]"
+    ↓
+processor.process() 带着转换后的消息调用大模型 API
+    ↓
+模型看到之前的内容 + 中断标记，决定如何继续
+```
 
 ---
 
@@ -1851,6 +2110,115 @@ export function create(input: {
 }
 ```
 
+#### 8.2.1 fullStream 的事件类型
+
+`stream.fullStream` 中的 `value.type` 是 **AI SDK 格式化后的统一结构**，不是大模型 API 直接返回的原始格式。
+
+**value.type 的可能值**：
+
+| 事件类型 | 含义 |
+|---------|------|
+| `start` | 流开始 |
+| `reasoning-start` | 推理开始（如 Claude 的 thinking） |
+| `reasoning-delta` | 推理内容增量 |
+| `reasoning-end` | 推理结束 |
+| `text-start` | 文本开始 |
+| `text-delta` | 文本增量 |
+| `text-end` | 文本结束 |
+| `tool-call` | 工具调用 |
+| `tool-result` | 工具结果 |
+| `finish-step` | 步骤完成（包含 usage、finishReason） |
+| `error` | 错误 |
+
+#### 8.2.2 AI SDK 的架构和转换
+
+不同模型 API 返回的原始格式不同，AI SDK 将它们统一转换为标准格式：
+
+**AI SDK 架构**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     OpenCode 代码                            │
+│  stream.fullStream → value.type = "text-delta", "tool-call" │
+└─────────────────────────────────────────────────────────────┘
+                              ↑ 统一格式
+┌─────────────────────────────────────────────────────────────┐
+│                    ai 包 (核心 SDK)                          │
+│  streamText() → 返回 StreamTextResult.fullStream            │
+└─────────────────────────────────────────────────────────────┘
+                              ↑ 调用 doStream()
+┌─────────────────────────────────────────────────────────────┐
+│                 @ai-sdk/provider (接口定义)                  │
+│  LanguageModelV2.doStream() → 返回统一格式的 Stream          │
+└─────────────────────────────────────────────────────────────┘
+                              ↑ 实现
+┌──────────────────┬──────────────────┬───────────────────────┐
+│ @ai-sdk/anthropic│ @ai-sdk/openai   │ @ai-sdk/google        │
+│                  │                  │                       │
+│ Anthropic API    │ OpenAI API       │ Google API            │
+│ 原始响应         │ 原始响应         │ 原始响应              │
+│      ↓           │      ↓           │      ↓                │
+│ 转换为统一格式   │ 转换为统一格式   │ 转换为统一格式        │
+└──────────────────┴──────────────────┴───────────────────────┘
+```
+
+**不同提供商的原始事件对比**：
+
+| 提供商 | 原始事件类型 |
+|-------|-------------|
+| Anthropic | `content_block_start`, `content_block_delta`, `message_stop` |
+| OpenAI | `response.created`, `response.output_item.added` |
+| Google | `generateContentResponse` |
+
+**转换示例**（`@ai-sdk/anthropic` 内部实现，伪代码）：
+
+```typescript
+// @ai-sdk/anthropic 内部实现
+async *doStream({ prompt }) {
+  // 1. 调用 Anthropic API
+  const response = await anthropic.messages.stream({
+    model: "claude-3-opus",
+    messages: prompt,
+  })
+
+  // 2. 转换为统一格式
+  for await (const event of response) {
+    switch (event.type) {
+      case "content_block_start":
+        yield { type: "text-start", id: event.index }
+        break
+      case "content_block_delta":
+        yield { type: "text-delta", delta: event.delta.text }
+        break
+      case "message_stop":
+        yield { type: "finish-step", finishReason: "stop" }
+        break
+    }
+  }
+}
+```
+
+**项目中的依赖**：
+
+```
+package.json:
+├── ai                      # 核心 SDK，提供 streamText()
+├── @ai-sdk/provider        # 接口定义
+├── @ai-sdk/anthropic       # Anthropic → 统一格式
+├── @ai-sdk/openai          # OpenAI → 统一格式
+├── @ai-sdk/google          # Google → 统一格式
+├── @ai-sdk/amazon-bedrock  # Bedrock → 统一格式
+└── ... 其他 provider
+```
+
+**各层职责**：
+
+| 层级 | 职责 |
+|------|------|
+| `ai` 包 | 提供 `streamText()` 和 `fullStream` 接口 |
+| `@ai-sdk/provider` | 定义统一的事件类型（`text-delta`、`tool-call` 等） |
+| `@ai-sdk/anthropic` 等 | 将特定 API 响应转换为统一格式 |
+
 **Processor 的作用**:
 1. 管理助手消息和工具调用
 2. 调用 `LLM.stream()` 与大模型通信
@@ -1891,14 +2259,87 @@ export async function system() {
 
 ### 9.2 指令文件查找顺序
 
-1. 项目目录下的 `AGENTS.md`, `CLAUDE.md`, `CONTEXT.md`
-2. 全局配置目录下的 `AGENTS.md`
-3. `~/.claude/CLAUDE.md` (Claude Code 兼容)
-4. 配置中指定的 URL
+#### 9.2.1 文件查找优先级
+
+**FILES 数组定义了查找顺序**：`["AGENTS.md", "CLAUDE.md", "CONTEXT.md"]`
+
+**位置**：`src/session/instruction.ts:13-17`
+
+```typescript
+const FILES = [
+  "AGENTS.md",
+  "CLAUDE.md",
+  "CONTEXT.md", // deprecated
+]
+```
+
+#### 9.2.2 项目目录查找（替换关系）
+
+**位置**：`src/session/instruction.ts:75-84`
+
+```typescript
+for (const file of FILES) {
+  const matches = await Filesystem.findUp(file, Instance.directory, Instance.worktree)
+  if (matches.length > 0) {
+    matches.forEach((p) => { paths.add(path.resolve(p)) })
+    break  // ← 关键：找到第一个存在的文件类型就停止
+  }
+}
+```
+
+**查找逻辑**：
+1. 在当前目录向上查找 `AGENTS.md`
+2. 如果没找到，在当前目录向上查找 `CLAUDE.md`
+3. 如果没找到，在当前目录向上查找 `CONTEXT.md`
+4. 找到任意一个就**停止**查找其他文件名
+
+**是替换关系**：当前目录有 `AGENTS.md` 就不会查找 `CLAUDE.md` 和 `CONTEXT.md`。
+
+#### 9.2.3 全局目录查找
+
+**位置**：`src/session/instruction.ts:19-29, 87-92`
+
+```typescript
+function globalFiles() {
+  const files = []
+  if (Flag.OPENCODE_CONFIG_DIR) {
+    files.push(path.join(Flag.OPENCODE_CONFIG_DIR, "AGENTS.md"))
+  }
+  files.push(path.join(Global.Path.config, "AGENTS.md"))
+  if (!Flag.OPENCODE_DISABLE_CLAUDE_CODE_PROMPT) {
+    files.push(path.join(os.homedir(), ".claude", "CLAUDE.md"))
+  }
+  return files
+}
+
+for (const file of globalFiles()) {
+  if (await Bun.file(file).exists()) {
+    paths.add(path.resolve(file))
+    break  // ← 找到第一个存在的就停止
+  }
+}
+```
+
+#### 9.2.4 项目目录和全局目录的关系（叠加关系）
+
+| 来源 | 结果 |
+|------|------|
+| 项目目录 | 找到一个文件（AGENTS.md 或 CLAUDE.md 或 CONTEXT.md） |
+| 全局目录 | 找到一个文件 |
+| **最终** | 两个文件**叠加**（如果都存在） |
+
+**不是替换**：当前目录有 `CLAUDE.md` **不会阻止**查找全局目录的文件。
+
+#### 9.2.5 文件都不存在时
+
+如果所有指令文件都不存在：
+- `paths` 为空 Set
+- `InstructionPrompt.system()` 返回空内容
+- 只使用 agent 默认提示词 + 环境信息 + 用户输入
 
 ### 9.3 使用方式
 
-**位置**: `src/session/prompt.ts:659`
+**位置**: `src/session/prompt.ts:667`
 
 ```typescript
 const system = [
@@ -1906,6 +2347,96 @@ const system = [
   ...(await InstructionPrompt.system())        // 指令文件
 ]
 ```
+
+### 9.4 完整的 system 提示词组成
+
+#### 9.4.1 system 提示词的堆栈
+
+**位置**：`src/session/llm.ts:67-79`
+
+```typescript
+const system = []
+system.push(
+  [
+    // 1. agent 提示词 或 提供商默认提示词
+    ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+    // 2. 环境信息 + 指令文件内容（来自 prompt.ts）
+    ...input.system,
+    // 3. 用户消息中的自定义系统提示词
+    ...(input.user.system ? [input.user.system] : []),
+  ]
+    .filter((x) => x)
+    .join("\n"),
+)
+```
+
+**system 提示词堆栈**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      system 提示词                          │
+├─────────────────────────────────────────────────────────────┤
+│ 1. agent.prompt 或 SystemPrompt.provider(model)            │
+│    - agent 自定义提示词，或根据模型提供商返回默认提示词       │
+├─────────────────────────────────────────────────────────────┤
+│ 2. SystemPrompt.environment(model)                          │
+│    - 模型信息、工作目录、平台、日期等                        │
+├─────────────────────────────────────────────────────────────┤
+│ 3. InstructionPrompt.system()                               │
+│    - AGENTS.md / CLAUDE.md / CONTEXT.md 内容               │
+├─────────────────────────────────────────────────────────────┤
+│ 4. user.system                                              │
+│    - 用户消息中附带的自定义系统提示词                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 9.4.2 agent.prompt 的来源
+
+从 agent 配置中获取，不同 agent 有不同的提示词：
+
+```typescript
+// agent.ts 中的定义
+export const AgentSchema = z.object({
+  name: z.string(),
+  prompt: z.string().optional(),  // ← 自定义提示词
+  // ...
+})
+
+// 内置 Agent 示例
+const agents = {
+  build: { prompt: "You are a helpful coding assistant..." },
+  plan: { prompt: "You are a planning assistant..." },
+  compaction: { prompt: "Summarize the conversation..." },
+  // ...
+}
+```
+
+#### 9.4.3 调用 API 时的消息结构
+
+**位置**：`src/session/llm.ts:229-237`
+
+```typescript
+messages: [
+  ...system.map((x): ModelMessage => ({
+    role: "system",   // ← 明确是 system 角色
+    content: x,
+  })),
+  ...input.messages,  // ← 用户消息历史（user/assistant 交替）
+]
+```
+
+**系统提示词和用户输入不在同一个字段**：
+- `system` → `{ role: "system", content: "..." }`
+- `input.messages` → `{ role: "user/assistant", content: "..." }`
+
+#### 9.4.4 总结
+
+| 问题 | 答案 |
+|------|------|
+| agent.prompt 是系统还是用户提示词？ | **系统提示词**，`role: "system"` |
+| 系统提示词和用户输入是否同字段？ | **不是**，分开传递给 AI SDK |
+| 存在 AGENTS.md 是否替换 agent.prompt？ | **不是替换，是叠加**，都会被使用 |
+| agent.prompt 从哪获取？ | agent 配置中定义，不同 agent 有不同提示词 |
 
 ---
 
@@ -1978,7 +2509,241 @@ export async function stream(input: StreamInput) {
 }
 ```
 
-### 10.3 实际 API 调用
+### 10.3 streamText 参数详解
+
+**位置**: `src/session/llm.ts:176-259`
+
+#### 10.3.1 完整参数列表
+
+```typescript
+return streamText({
+  onError(error) { ... },
+  async experimental_repairToolCall(failed) { ... },
+  temperature: params.temperature,
+  topP: params.topP,
+  topK: params.topK,
+  providerOptions: ProviderTransform.providerOptions(input.model, params.options),
+  activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+  tools,
+  toolChoice: input.toolChoice,
+  maxOutputTokens,
+  abortSignal: input.abort,
+  headers: { ... },
+  maxRetries: input.retries ?? 0,
+  messages: [
+    ...system.map((x) => ({ role: "system", content: x })),
+    ...input.messages,
+  ],
+  model: wrapLanguageModel({ model: language, middleware: [...] }),
+  experimental_telemetry: { ... },
+})
+```
+
+#### 10.3.2 参数说明总览
+
+| 参数 | 类型 | 用途 |
+|------|------|------|
+| `onError` | 回调函数 | 流式请求出错时的处理函数，记录错误日志 |
+| `experimental_repairToolCall` | 回调函数 | 工具调用失败时的修复逻辑 |
+| `temperature` | number (0-2) | 控制输出随机性，值越高越随机 |
+| `topP` | number (0-1) | nucleus sampling，限制候选 token 的累积概率 |
+| `topK` | number | top-k sampling，限制候选 token 的数量 |
+| `providerOptions` | object | 提供商特定选项（如 Anthropic 缓存配置） |
+| `activeTools` | string[] | 当前会话中**允许被自动调用**的工具列表 |
+| `tools` | object | 所有可用工具的定义 |
+| `toolChoice` | "auto" \| "required" \| "none" | 工具选择策略 |
+| `maxOutputTokens` | number | 模型输出的最大 token 数 |
+| `abortSignal` | AbortSignal | 用于中止请求的信号 |
+| `headers` | object | 自定义 HTTP 请求头 |
+| `maxRetries` | number | 请求失败时的最大重试次数 |
+| `messages` | ModelMessage[] | 对话消息历史 |
+| `model` | LanguageModel | AI SDK 的语言模型实例 |
+| `experimental_telemetry` | object | OpenTelemetry 遥测配置 |
+
+#### 10.3.3 关键参数详解
+
+**1. temperature / topP / topK（生成控制）**
+
+```typescript
+temperature: input.agent.temperature ?? ProviderTransform.temperature(input.model),
+topP: input.agent.topP ?? ProviderTransform.topP(input.model),
+topK: ProviderTransform.topK(input.model),
+```
+
+| 参数 | 范围 | 说明 |
+|------|------|------|
+| `temperature` | 0-2 | 越高越有创意，0 = 贪婪解码（最确定） |
+| `topP` | 0-1 | 0.9 表示只考虑累积概率前 90% 的 token |
+| `topK` | 正整数 | 只考虑概率最高的 K 个 token |
+
+**2. tools / activeTools / toolChoice（工具调用）**
+
+```typescript
+tools,                                                    // 所有可用工具定义
+activeTools: Object.keys(tools).filter((x) => x !== "invalid"),  // 允许自动调用的
+toolChoice: input.toolChoice,                             // 工具选择策略
+```
+
+| 参数 | 说明 |
+|------|------|
+| `tools` | 工具定义对象，包含 name、description、inputSchema、execute |
+| `activeTools` | 哪些工具可以被模型**自动选择**调用 |
+| `toolChoice` | `"auto"`：模型自己决定；`"required"`：必须调用；`"none"`：禁止调用 |
+
+**3. experimental_repairToolCall（工具修复）**
+
+```typescript
+async experimental_repairToolCall(failed) {
+  const lower = failed.toolCall.toolName.toLowerCase()
+  if (lower !== failed.toolCall.toolName && tools[lower]) {
+    // 修复大小写问题：模型调用 "Read" → 修复为 "read"
+    return { ...failed.toolCall, toolName: lower }
+  }
+  // 无法修复，标记为无效工具
+  return { ...failed.toolCall, toolName: "invalid" }
+}
+```
+
+用途：当模型调用工具名大小写不匹配时，自动修复或标记为无效。
+
+**4. model + middleware（模型包装）**
+
+```typescript
+model: wrapLanguageModel({
+  model: language,
+  middleware: [{
+    async transformParams(args) {
+      if (args.type === "stream") {
+        // 在发送前转换消息格式
+        args.params.prompt = ProviderTransform.message(args.params.prompt, input.model, options)
+      }
+      return args.params
+    },
+  }],
+})
+```
+
+**三个关键概念**：
+
+| 概念 | 含义 |
+|------|------|
+| `language` | `LanguageModelV2` 实例，封装了如何调用特定模型 API |
+| `wrapLanguageModel` | AI SDK 函数，包装语言模型，添加中间件功能 |
+| `middleware` | 中间件数组，在请求发送前后对参数进行转换 |
+
+**language 是什么？**
+
+`language` 是 `LanguageModelV2` 类型，代表一个可调用的大模型实例。
+
+```typescript
+// llm.ts:60
+const [language, cfg, provider, auth] = await Promise.all([
+  Provider.getLanguage(input.model),  // ← 获取语言模型实例
+  // ...
+])
+
+// provider.ts:1171-1196
+export async function getLanguage(model: Model): Promise<LanguageModelV2> {
+  const sdk = await getSDK(model)  // 获取 SDK（如 @ai-sdk/anthropic）
+
+  // 创建语言模型实例
+  const language = sdk.languageModel(model.api.id)  // 如 anthropic("claude-3-opus")
+  return language
+}
+```
+
+**language 的本质**：
+- 对于 Anthropic：`anthropic("claude-3-opus")` 返回的对象
+- 对于 OpenAI：`openai("gpt-4")` 返回的对象
+- 它封装了**如何调用特定模型 API** 的所有逻辑
+
+**wrapLanguageModel 的用途**：
+
+`wrapLanguageModel` 是 AI SDK 提供的函数，用于包装语言模型，添加中间件功能：
+
+- 不改变原始语言模型的能力
+- 在调用前后插入自定义逻辑（中间件）
+- 类似于 Express.js 的中间件概念
+
+**middleware 的工作流程**：
+
+```
+streamText() 调用
+    ↓
+wrapLanguageModel 拦截
+    ↓
+middleware.transformParams() 执行
+    ↓
+修改 args.params（如消息格式转换）
+    ↓
+返回转换后的参数
+    ↓
+实际调用模型 API
+```
+
+**为什么要用 middleware？**
+
+不同模型提供商有不同的消息格式要求。`ProviderTransform.message` 会：
+- 调整消息格式
+- 添加特定提供商需要的字段
+- 处理特殊情况（如缓存标记）
+
+**举例**：
+```typescript
+// 原始消息
+{ role: "user", content: "hello" }
+
+// 转换后（针对特定提供商）
+{ role: "user", content: [{ type: "text", text: "hello" }], cache_control: { ... } }
+```
+
+**类比**：
+- `language` = 真实的电话
+- `wrapLanguageModel` = 电话适配器
+- `middleware` = 适配器中的信号转换器
+
+**5. abortSignal（请求中止）**
+
+```typescript
+abortSignal: input.abort,
+```
+
+用途：用户取消请求时（Ctrl+C），通过 AbortSignal 通知 AI SDK 中止流式请求。
+
+**6. headers（请求头）**
+
+```typescript
+headers: {
+  // OpenCode 内部提供商
+  ...(input.model.providerID.startsWith("opencode") ? {
+    "x-opencode-project": Instance.project.id,
+    "x-opencode-session": input.sessionID,
+    "x-opencode-request": input.user.id,
+    "x-opencode-client": Flag.OPENCODE_CLIENT,
+  } : input.model.providerID !== "anthropic" ? {
+    // 其他提供商
+    "User-Agent": `opencode/${Installation.VERSION}`,
+  } : undefined),
+  ...input.model.headers,  // 模型配置中的自定义头
+  ...headers,              // 插件注入的头
+},
+```
+
+**7. experimental_telemetry（遥测）**
+
+```typescript
+experimental_telemetry: {
+  isEnabled: cfg.experimental?.openTelemetry,
+  metadata: {
+    userId: cfg.username ?? "unknown",
+    sessionId: input.sessionID,
+  },
+},
+```
+
+用途：OpenTelemetry 遥测配置，用于追踪和监控 API 调用。
+
+### 10.4 实际 API 调用
 
 `streamText` 来自 `@ai-sdk/*` 包，它会：
 1. 根据 provider 配置选择正确的 SDK
