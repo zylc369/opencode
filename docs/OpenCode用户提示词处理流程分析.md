@@ -5077,94 +5077,966 @@ if (part.type === "tool" && part.state.status === "completed") {
 
 ## 17. 用户确认机制
 
-### 17.1 权限请求
+本节详细描述权限确认的完整流程，包括触发起点、服务端处理、客户端接收、用户交互和回复处理。
 
-**位置**: `src/permission/next.ts:131-161`
+### 17.1 完整流程概览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          用户确认机制完整流程                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  【服务端 - 工具执行层】                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 触发起点：工具执行时调用 ctx.ask()                                  │   │
+│  │    位置：src/session/prompt.ts:787-794                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【服务端 - 权限处理层】                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 2. PermissionNext.ask() 评估规则                                      │   │
+│  │    位置：src/permission/next.ts:131-161                              │   │
+│  │    - 如果 action === "deny" → 抛出 DeniedError                        │   │
+│  │    - 如果 action === "allow" → 直接通过                               │   │
+│  │    - 如果 action === "ask" → 创建 Promise，存储到 pending             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【服务端 - 事件发布层】                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 3. Bus.publish(Event.Asked, info)                                    │   │
+│  │    位置：src/permission/next.ts:155                                  │   │
+│  │    ↓                                                                  │   │
+│  │    GlobalBus.emit("event", { directory, payload })                   │   │
+│  │    位置：src/bus/index.ts:59-62                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【传输层 - SSE】                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 4. SSE 端点推送事件                                                   │   │
+│  │    位置：src/server/routes/global.ts:80-84                           │   │
+│  │    stream.writeSSE({ data: JSON.stringify(event) })                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【客户端 - 事件接收层】                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 5. sdk.event.listen() 接收事件                                        │   │
+│  │    位置：src/cli/cmd/tui/context/sync.tsx:107                        │   │
+│  │    ↓                                                                  │   │
+│  │ 6. 存储到 store.permission[sessionID]                                │   │
+│  │    位置：src/cli/cmd/tui/context/sync.tsx:128-147                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【客户端 - UI 渲染层】                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 7. PermissionPrompt 组件渲染确认对话框                                 │   │
+│  │    位置：src/cli/cmd/tui/routes/session/permission.tsx:128-465       │   │
+│  │    显示选项：Allow once / Allow always / Reject                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【用户交互】                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 8. 用户按键选择（←/→ 切换，Enter 确认）                                │   │
+│  │    位置：src/cli/cmd/tui/routes/session/permission.tsx:560-592       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【客户端 - 发送回复】                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 9. sdk.client.permission.reply() 发送用户选择                         │   │
+│  │    位置：src/cli/cmd/tui/routes/session/permission.tsx:446-455       │   │
+│  │    HTTP POST /permission/:requestID/reply                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【服务端 - 处理回复】                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 10. PermissionNext.reply() 处理回复                                   │   │
+│  │     位置：src/permission/next.ts:163-234                             │   │
+│  │     - 从 pending 中取出请求                                           │   │
+│  │     - resolve() 或 reject() Promise                                  │   │
+│  │     - 发布 permission.replied 事件                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【服务端 - 工具继续执行】                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 11. Promise resolve → 工具继续执行                                    │   │
+│  │     Promise reject → 抛出错误，工具执行中断                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 17.2 第一步：触发起点 - 工具执行时调用 ctx.ask()
+
+**位置**：`src/session/prompt.ts:762-794`
+
+**触发场景**：当工具（如 Bash、Edit、Write）需要执行敏感操作时，会调用 `ctx.ask()` 请求用户确认。
+
+**代码流程**：
 
 ```typescript
-export const ask = fn(Request.partial({ id: true }).extend({ ruleset: Ruleset }), async (input) => {
-  const s = await state()
+// src/session/prompt.ts:762-794
+const context = (args: any, options: ToolCallOptions): Tool.Context => ({
+  // ... 其他字段
 
-  for (const pattern of request.patterns ?? []) {
-    const rule = evaluate(request.permission, pattern, ruleset, s.approved)
+  // ★ 权限请求方法
+  async ask(req) {
+    await PermissionNext.ask({
+      ...req,
+      sessionID: input.session.id,
+      tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+      ruleset: PermissionNext.merge(input.agent.permission, input.session.permission ?? []),
+    })
+  },
+})
 
-    if (rule.action === "deny")
-      throw new DeniedError(...)
-
-    if (rule.action === "ask") {
-      return new Promise<void>((resolve, reject) => {
-        const info: Request = { id, ...request }
-        s.pending[id] = { info, resolve, reject }
-        Bus.publish(Event.Asked, info)  // 发布询问事件
-      })
-    }
-
-    if (rule.action === "allow") continue
-  }
+// 工具执行时调用
+tools[item.id] = tool({
+  async execute(args, options) {
+    const ctx = context(args, options)
+    // 工具内部调用 ctx.ask() 触发权限请求
+    const result = await item.execute(args, ctx)
+    return result
+  },
 })
 ```
 
-### 17.2 权限回复
-
-**位置**: `src/permission/next.ts:163-234`
+**工具调用示例**（`src/tool/websearch.ts:66-77`）：
 
 ```typescript
-export const reply = fn(z.object({
-  requestID: Identifier.schema("permission"),
-  reply: Reply,  // "once" | "always" | "reject"
-  message: z.string().optional(),
-}), async (input) => {
-  const existing = s.pending[input.requestID]
-
-  if (input.reply === "reject") {
-    existing.reject(new RejectedError())
-    // 拒绝该 session 的所有待处理权限
-    // ...
-  }
-
-  if (input.reply === "once") {
-    existing.resolve()
-  }
-
-  if (input.reply === "always") {
-    // 添加到永久允许列表
-    s.approved.push({...})
-    existing.resolve()
-  }
-})
-```
-
-### 17.3 工具调用中的权限检查
-
-**位置**: `src/session/prompt.ts:779-786`
-
-```typescript
-async ask(req) {
-  await PermissionNext.ask({
-    ...req,
-    sessionID: input.session.id,
-    tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-    ruleset: PermissionNext.merge(input.agent.permission, input.session.permission ?? []),
+async execute(params, ctx) {
+  // ★ 调用 ctx.ask() 触发权限请求
+  await ctx.ask({
+    permission: "websearch",
+    patterns: [params.query],
+    always: ["*"],
+    metadata: { query: params.query, ... },
   })
+
+  // 如果用户允许，继续执行
+  const response = await fetch(...)
+  return { output: ..., title: ..., metadata: {} }
 }
 ```
 
-### 17.4 权限交互流程
+### 17.3 第二步：服务端评估规则
+
+**位置**：`src/permission/next.ts:131-161`
+
+```typescript
+export const ask = fn(
+  Request.partial({ id: true }).extend({ ruleset: Ruleset }),
+  async (input) => {
+    const s = await state()
+    const { ruleset, ...request } = input
+
+    // 遍历所有 pattern
+    for (const pattern of request.patterns ?? []) {
+      // ★ 评估规则
+      const rule = evaluate(request.permission, pattern, ruleset, s.approved)
+      log.info("evaluated", { permission: request.permission, pattern, action: rule.action })
+
+      // 情况 1：明确拒绝
+      if (rule.action === "deny") {
+        throw new DeniedError(ruleset.filter((r) => Wildcard.match(request.permission, r.permission)))
+      }
+
+      // 情况 2：需要询问用户
+      if (rule.action === "ask") {
+        const id = input.id ?? Identifier.ascending("permission")
+        // ★ 创建 Promise，工具执行在此处暂停
+        return new Promise<void>((resolve, reject) => {
+          const info: Request = { id, ...request }
+          // 存储到 pending，等待用户回复
+          s.pending[id] = { info, resolve, reject }
+          // ★ 发布事件，通知客户端
+          Bus.publish(Event.Asked, info)
+        })
+      }
+
+      // 情况 3：明确允许
+      if (rule.action === "allow") continue
+    }
+  },
+)
+```
+
+**规则评估逻辑**（`src/permission/next.ts:236-243`）：
+
+```typescript
+export function evaluate(permission: string, pattern: string, ...rulesets: Ruleset[]): Rule {
+  const merged = merge(...rulesets)
+  // 查找最后一个匹配的规则
+  const match = merged.findLast(
+    (rule) => Wildcard.match(permission, rule.permission) && Wildcard.match(pattern, rule.pattern),
+  )
+  // 如果没有匹配规则，默认 "ask"
+  return match ?? { action: "ask", permission, pattern: "*" }
+}
+```
+
+**规则来源**：
+
+| 来源 | 说明 |
+|------|------|
+| `agent.permission` | Agent 配置中的权限规则 |
+| `session.permission` | Session 创建时指定的规则 |
+| `s.approved` | 用户之前选择 "Always allow" 的规则 |
+
+### 17.4 第三步：事件发布
+
+**位置**：`src/permission/next.ts:155` → `src/bus/index.ts:41-64`
+
+```typescript
+// PermissionNext.ask() 中
+Bus.publish(Event.Asked, info)
+
+// Bus.publish 内部
+export async function publish<Definition extends BusEvent.Definition>(
+  def: Definition,
+  properties: z.output<Definition["properties"]>,
+) {
+  const payload = { type: def.type, properties }
+
+  // 1. 通知本地订阅者
+  for (const key of [def.type, "*"]) {
+    const match = state().subscriptions.get(key)
+    for (const sub of match ?? []) {
+      pending.push(sub(payload))
+    }
+  }
+
+  // 2. ★ 发送到全局事件总线（用于跨进程/跨 worktree）
+  GlobalBus.emit("event", {
+    directory: Instance.directory,
+    payload,
+  })
+
+  return Promise.all(pending)
+}
+```
+
+### 17.5 第四步：SSE 推送给客户端
+
+**位置**：`src/server/routes/global.ts:80-84`
+
+```typescript
+// SSE 端点
+async function handler(event: any) {
+  await stream.writeSSE({
+    data: JSON.stringify(event),  // ← 推送给客户端
+  })
+}
+GlobalBus.on("event", handler)
+```
+
+**事件数据格式**：
+
+```json
+{
+  "directory": "/path/to/project",
+  "payload": {
+    "type": "permission.asked",
+    "properties": {
+      "id": "permission_abc123",
+      "sessionID": "session_xyz",
+      "permission": "bash",
+      "patterns": ["npm test"],
+      "metadata": { "command": "npm test" },
+      "always": ["*"],
+      "tool": { "messageID": "msg_123", "callID": "call_456" }
+    }
+  }
+}
+```
+
+### 17.6 第五步：客户端接收并存储
+
+**位置**：`src/cli/cmd/tui/context/sync.tsx:107-148`
+
+```typescript
+sdk.event.listen((e) => {
+  const event = e.details
+  switch (event.type) {
+    // ★ 处理权限请求事件
+    case "permission.asked": {
+      const request = event.properties
+      const requests = store.permission[request.sessionID]
+
+      if (!requests) {
+        // 首次创建
+        setStore("permission", request.sessionID, [request])
+        break
+      }
+
+      // 已存在，插入到正确位置（按 ID 排序）
+      const match = Binary.search(requests, request.id, (r) => r.id)
+      if (match.found) {
+        setStore("permission", request.sessionID, match.index, reconcile(request))
+        break
+      }
+      setStore(
+        "permission",
+        request.sessionID,
+        produce((draft) => {
+          draft.splice(match.index, 0, request)
+        }),
+      )
+      break
+    }
+
+    // 处理权限回复事件（从 pending 中移除）
+    case "permission.replied": {
+      const requests = store.permission[event.properties.sessionID]
+      if (!requests) break
+      const match = Binary.search(requests, event.properties.requestID, (r) => r.id)
+      if (!match.found) break
+      setStore(
+        "permission",
+        event.properties.sessionID,
+        produce((draft) => {
+          draft.splice(match.index, 1)
+        }),
+      )
+      break
+    }
+  }
+})
+```
+
+### 17.7 第六步：UI 渲染确认对话框
+
+**位置**：`src/cli/cmd/tui/routes/session/permission.tsx:128-465`
+
+**组件结构**：
+
+```tsx
+export function PermissionPrompt(props: { request: PermissionRequest }) {
+  const [store, setStore] = createStore({
+    stage: "permission" as PermissionStage,  // "permission" | "always" | "reject"
+  })
+
+  return (
+    <Switch>
+      {/* 阶段 1：主确认界面 */}
+      <Match when={store.stage === "permission"}>
+        <Prompt
+          title="Permission required"
+          header={...}
+          body={...}
+          options={{
+            once: "Allow once",     // 本次允许
+            always: "Allow always", // 永久允许
+            reject: "Reject"        // 拒绝
+          }}
+          escapeKey="reject"
+          onSelect={(option) => {
+            if (option === "always") {
+              setStore("stage", "always")  // 进入确认阶段
+              return
+            }
+            if (option === "reject") {
+              setStore("stage", "reject")  // 进入拒绝阶段（可输入反馈）
+              return
+            }
+            // ★ 发送 "once" 回复
+            sdk.client.permission.reply({
+              reply: "once",
+              requestID: props.request.id,
+            })
+          }}
+        />
+      </Match>
+
+      {/* 阶段 2：确认 "Always allow" */}
+      <Match when={store.stage === "always"}>
+        <Prompt
+          title="Always allow"
+          body={<TextBody title="This will allow ... until OpenCode is restarted." />}
+          options={{ confirm: "Confirm", cancel: "Cancel" }}
+          onSelect={(option) => {
+            if (option === "cancel") {
+              setStore("stage", "permission")
+              return
+            }
+            // ★ 发送 "always" 回复
+            sdk.client.permission.reply({
+              reply: "always",
+              requestID: props.request.id,
+            })
+          }}
+        />
+      </Match>
+
+      {/* 阶段 3：拒绝并输入反馈 */}
+      <Match when={store.stage === "reject"}>
+        <RejectPrompt
+          onConfirm={(message) => {
+            // ★ 发送 "reject" 回复（带反馈消息）
+            sdk.client.permission.reply({
+              reply: "reject",
+              requestID: props.request.id,
+              message: message || undefined,
+            })
+          }}
+          onCancel={() => setStore("stage", "permission")}
+        />
+      </Match>
+    </Switch>
+  )
+}
+```
+
+**用户选项**：
+
+| 选项 | 行为 | 效果 |
+|------|------|------|
+| **Allow once** | 本次允许 | 仅当前操作允许，下次还需确认 |
+| **Allow always** | 永久允许 | 添加到 approved 规则，本次会话内不再询问 |
+| **Reject** | 拒绝 | 抛出 RejectedError，工具执行中断 |
+
+### 17.8 第七步：键盘交互
+
+**位置**：`src/cli/cmd/tui/routes/session/permission.tsx:560-592`
+
+```typescript
+useKeyboard((evt) => {
+  // ← / h：向左选择
+  if (evt.name === "left" || evt.name === "h") {
+    evt.preventDefault()
+    const idx = keys.indexOf(store.selected)
+    const next = keys[(idx - 1 + keys.length) % keys.length]
+    setStore("selected", next)
+  }
+
+  // → / l：向右选择
+  if (evt.name === "right" || evt.name === "l") {
+    evt.preventDefault()
+    const idx = keys.indexOf(store.selected)
+    const next = keys[(idx + 1) % keys.length]
+    setStore("selected", next)
+  }
+
+  // Enter：确认选择
+  if (evt.name === "return") {
+    evt.preventDefault()
+    props.onSelect(store.selected)  // ← 触发 onSelect
+  }
+
+  // Escape：使用 escapeKey 选项
+  if (props.escapeKey && (evt.name === "escape" || keybind.match("app_exit", evt))) {
+    evt.preventDefault()
+    props.onSelect(props.escapeKey)
+  }
+})
+```
+
+### 17.9 第八步：发送回复到服务端
+
+**位置**：`src/server/routes/permission.ts:10-45`
+
+**HTTP 请求**：
 
 ```
-工具请求执行
+POST /permission/:requestID/reply
+Content-Type: application/json
+
+{
+  "reply": "once",  // "once" | "always" | "reject"
+  "message": "optional feedback message"
+}
+```
+
+**服务端处理**：
+
+```typescript
+// src/server/routes/permission.ts:35-44
+async (c) => {
+  const params = c.req.valid("param")
+  const json = c.req.valid("json")
+  await PermissionNext.reply({
+    requestID: params.requestID,
+    reply: json.reply,
+    message: json.message,
+  })
+  return c.json(true)
+}
+```
+
+### 17.10 第九步：服务端处理回复
+
+**位置**：`src/permission/next.ts:163-234`
+
+```typescript
+export const reply = fn(
+  z.object({
+    requestID: Identifier.schema("permission"),
+    reply: Reply,
+    message: z.string().optional(),
+  }),
+  async (input) => {
+    const s = await state()
+    const existing = s.pending[input.requestID]
+    if (!existing) return  // 请求不存在或已处理
+
+    delete s.pending[input.requestID]
+
+    // 发布回复事件（用于客户端同步）
+    Bus.publish(Event.Replied, {
+      sessionID: existing.info.sessionID,
+      requestID: existing.info.id,
+      reply: input.reply,
+    })
+
+    // ★ 情况 1：拒绝
+    if (input.reply === "reject") {
+      // reject Promise → 工具执行抛出错误
+      existing.reject(input.message ? new CorrectedError(input.message) : new RejectedError())
+
+      // 同时拒绝该 session 的所有其他待处理权限
+      const sessionID = existing.info.sessionID
+      for (const [id, pending] of Object.entries(s.pending)) {
+        if (pending.info.sessionID === sessionID) {
+          delete s.pending[id]
+          Bus.publish(Event.Replied, { sessionID, requestID: id, reply: "reject" })
+          pending.reject(new RejectedError())
+        }
+      }
+      return
+    }
+
+    // ★ 情况 2：本次允许
+    if (input.reply === "once") {
+      // resolve Promise → 工具继续执行
+      existing.resolve()
+      return
+    }
+
+    // ★ 情况 3：永久允许
+    if (input.reply === "always") {
+      // 添加到 approved 规则
+      for (const pattern of existing.info.always) {
+        s.approved.push({
+          permission: existing.info.permission,
+          pattern,
+          action: "allow",
+        })
+      }
+
+      existing.resolve()
+
+      // 自动批准该 session 中符合新规则的其他待处理权限
+      const sessionID = existing.info.sessionID
+      for (const [id, pending] of Object.entries(s.pending)) {
+        if (pending.info.sessionID !== sessionID) continue
+        const ok = pending.info.patterns.every(
+          (pattern) => evaluate(pending.info.permission, pattern, s.approved).action === "allow",
+        )
+        if (!ok) continue
+        delete s.pending[id]
+        Bus.publish(Event.Replied, { sessionID, requestID: id, reply: "always" })
+        pending.resolve()
+      }
+      return
+    }
+  },
+)
+```
+
+### 17.10 第十步：工具继续执行或中断
+
+**Promise 链**：
+
+```
+工具调用 ctx.ask()
     ↓
-ctx.ask() 调用
+PermissionNext.ask() 返回 Promise
     ↓
-PermissionNext.ask() 评估规则
+Promise 被 await 挂起，工具执行暂停
     ↓
-如果 action === "ask"
+用户回复后，reply() 调用 resolve() 或 reject()
     ↓
-Bus.publish(Event.Asked) → 前端显示确认框
+┌─────────────────────────────────────────────────────────────┐
+│ resolve() → Promise 完成 → ctx.ask() 返回 → 工具继续执行    │
+│ reject()  → Promise 失败 → ctx.ask() 抛出错误 → 工具中断    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**错误类型**：
+
+| 错误类型 | 触发条件 | 效果 |
+|---------|---------|------|
+| `RejectedError` | 用户拒绝（无反馈） | 工具中断，模型收到错误消息 |
+| `CorrectedError` | 用户拒绝（带反馈） | 工具中断，模型收到用户反馈 |
+| `DeniedError` | 配置规则拒绝 | 工具中断，显示匹配的规则 |
+
+### 17.11 完整时序图
+
+```
+工具执行                    服务端                        客户端(TUI)
+    │                         │                              │
+    │ ctx.ask()               │                              │
+    ├────────────────────────→│                              │
+    │                         │                              │
+    │                         │ evaluate() → "ask"           │
+    │                         │                              │
+    │                         │ s.pending[id] = {resolve,reject}│
+    │                         │                              │
+    │      await Promise ←────┤                              │
+    │      (工具暂停)          │                              │
+    │                         │                              │
+    │                         │ Bus.publish(Asked)           │
+    │                         ├─────────────────────────────→│
+    │                         │                              │
+    │                         │                   显示确认对话框│
+    │                         │                   [Allow once]│
+    │                         │                   [Allow always]│
+    │                         │                   [Reject]    │
+    │                         │                              │
+    │                         │                   用户按键选择│
+    │                         │                              │
+    │                         │      POST /permission/reply  │
+    │                         │←─────────────────────────────┤
+    │                         │                              │
+    │                         │ reply() 处理                 │
+    │                         │   - resolve()/reject()       │
+    │                         │   - Bus.publish(Replied)     │
+    │                         ├─────────────────────────────→│
+    │                         │                   移除确认对话框│
+    │                         │                              │
+    │      Promise 完成 ←─────┤                              │
+    │      (工具继续)          │                              │
+    │                         │                              │
+    ↓                         ↓                              ↓
+```
+
+### 17.12 权限配置来源与服务端处理
+
+用户可以通过配置文件或环境变量预设权限规则，让工具自动执行而无需交互确认。
+
+#### 17.12.1 配置方式
+
+**方式一：配置文件 (`opencode.json`)**
+
+```json
+{
+  "permission": {
+    "bash": "allow",
+    "edit": "allow",
+    "read": "allow",
+    "*": "allow"
+  }
+}
+```
+
+**方式二：环境变量 (`OPENCODE_PERMISSION`)**
+
+```bash
+OPENCODE_PERMISSION='{"bash":"allow","edit":"allow"}' opencode run "your message"
+```
+
+**方式三：详细格式（按 pattern 区分）**
+
+```json
+{
+  "permission": {
+    "bash": {
+      "npm test": "allow",
+      "npm run build": "allow",
+      "rm -rf *": "deny",
+      "*": "ask"
+    },
+    "edit": {
+      "src/**": "allow",
+      "*.json": "deny"
+    }
+  }
+}
+```
+
+#### 17.12.2 服务端处理流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     权限配置读取与使用流程                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  【第一步：配置读取】                                                         │
+│  位置：src/config/config.ts:205-207                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ // 1. 读取 opencode.json                                            │   │
+│  │ result = merge(result, await loadFile("opencode.json"))             │   │
+│  │                                                                      │   │
+│  │ // 2. 读取环境变量（优先级更高）                                       │   │
+│  │ if (Flag.OPENCODE_PERMISSION) {                                     │   │
+│  │   result.permission = mergeDeep(result.permission,                  │   │
+│  │     JSON.parse(Flag.OPENCODE_PERMISSION))                           │   │
+│  │ }                                                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【第二步：转换为 Ruleset】                                                   │
+│  位置：src/permission/next.ts:46-62                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ export function fromConfig(permission: Config.Permission) {          │   │
+│  │   const ruleset: Ruleset = []                                        │   │
+│  │   for (const [key, value] of Object.entries(permission)) {           │   │
+│  │     if (typeof value === "string") {                                 │   │
+│  │       // 简单格式: { "bash": "allow" }                               │   │
+│  │       ruleset.push({ permission: key, action: value, pattern: "*" })│   │
+│  │     } else {                                                         │   │
+│  │       // 详细格式: { "bash": { "npm test": "allow" } }               │   │
+│  │       ruleset.push(...Object.entries(value).map(([pattern, action]) =>│   │
+│  │         ({ permission: key, pattern: expand(pattern), action })))    │   │
+│  │     }                                                                │   │
+│  │   }                                                                  │   │
+│  │   return ruleset                                                    │   │
+│  │ }                                                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【第三步：Agent 初始化时合并规则】                                           │
+│  位置：src/agent/agent.ts:56-87                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ const state = Instance.state(async () => {                           │   │
+│  │   const cfg = await Config.get()                                    │   │
+│  │                                                                      │   │
+│  │   // 1. 默认规则（代码硬编码）                                         │   │
+│  │   const defaults = PermissionNext.fromConfig({                      │   │
+│  │     "*": "allow",                                                   │   │
+│  │     doom_loop: "ask",                                               │   │
+│  │     read: { "*.env": "ask", "*.env.*": "ask" },                     │   │
+│  │     question: "deny",                                               │   │
+│  │     plan_enter: "deny",                                             │   │
+│  │     plan_exit: "deny",                                              │   │
+│  │   })                                                                │   │
+│  │                                                                      │   │
+│  │   // 2. 用户配置规则（来自 opencode.json / 环境变量）                  │   │
+│  │   const user = PermissionNext.fromConfig(cfg.permission ?? {})      │   │
+│  │                                                                      │   │
+│  │   // 3. 合并规则（后面的覆盖前面的同名规则）                            │   │
+│  │   const build = {                                                   │   │
+│  │     name: "build",                                                  │   │
+│  │     permission: PermissionNext.merge(defaults, specific, user),     │   │
+│  │   }                                                                 │   │
+│  │ })                                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【第四步：工具执行时使用 ruleset】                                           │
+│  位置：src/session/prompt.ts:787-794                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ const context = (args, options) => ({                                │   │
+│  │   async ask(req) {                                                   │   │
+│  │     await PermissionNext.ask({                                      │   │
+│  │       ...req,                                                        │   │
+│  │       // ★ 合并 agent 和 session 的 ruleset                          │   │
+│  │       ruleset: PermissionNext.merge(                                │   │
+│  │         input.agent.permission,      // ← Agent 配置（含用户配置）    │   │
+│  │         input.session.permission ?? [] // ← Session 创建时传入       │   │
+│  │       ),                                                             │   │
+│  │     })                                                              │   │
+│  │   }                                                                 │   │
+│  │ })                                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                              │
+│  【第五步：评估规则】                                                         │
+│  位置：src/permission/next.ts:236-243                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ export function evaluate(permission, pattern, ...rulesets) {         │   │
+│  │   const merged = merge(...rulesets)  // 展开所有规则                  │   │
+│  │                                                                      │   │
+│  │   // ★ 查找最后一个匹配的规则（后面的覆盖前面的）                       │   │
+│  │   const match = merged.findLast(                                    │   │
+│  │     (rule) => Wildcard.match(permission, rule.permission)           │   │
+│  │           && Wildcard.match(pattern, rule.pattern)                  │   │
+│  │   )                                                                 │   │
+│  │                                                                      │   │
+│  │   // 没有匹配则默认 "ask"                                             │   │
+│  │   return match ?? { action: "ask", permission, pattern: "*" }       │   │
+│  │ }                                                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 17.12.3 规则优先级（从低到高）
+
+```
+1. 代码中的默认规则 (defaults)
+      ↓
+2. Agent 特定规则 (build, plan, explore 等)
+      ↓
+3. opencode.json 中的 permission 配置
+      ↓
+4. 环境变量 OPENCODE_PERMISSION
+      ↓
+5. Session 创建时传入的 permission (CLI Run)
+      ↓
+6. 用户选择 "Always allow" 后的动态规则 (s.approved)
+```
+
+**优先级示例**：
+
+```typescript
+// 规则合并顺序
+PermissionNext.merge(
+  defaults,                              // 优先级 1
+  agentSpecific,                         // 优先级 2
+  userConfig,                            // 优先级 3 (opencode.json)
+  envConfig,                             // 优先级 4 (环境变量)
+  sessionPermission,                     // 优先级 5 (CLI Run 传入)
+)
+
+// evaluate() 使用 findLast() 查找
+// 后面的规则会覆盖前面的同名规则
+```
+
+#### 17.12.4 evaluate() 的匹配逻辑
+
+```typescript
+// 规则数组（已合并）
+const ruleset = [
+  { permission: "*", pattern: "*", action: "allow" },       // 默认
+  { permission: "read", pattern: "*.env", action: "ask" },  // 覆盖 .env
+  { permission: "bash", pattern: "*", action: "allow" },    // 用户配置
+]
+
+// 查找 bash + "npm test"
+// 1. 匹配 permission: "*" + pattern: "*" → allow
+// 2. 匹配 permission: "bash" + pattern: "*" → allow (findLast 返回这个)
+
+// 查找 read + ".env"
+// 1. 匹配 permission: "*" + pattern: "*" → allow
+// 2. 匹配 permission: "read" + pattern: "*.env" → ask (findLast 返回这个)
+```
+
+### 17.13 配置后跳过确认的流程
+
+当用户配置了 `action: "allow"` 规则后，权限检查流程会跳过客户端确认：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    配置 allow 后的流程（无客户端交互）                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  工具执行 ctx.ask({ permission: "bash", patterns: ["npm test"] })           │
+│      ↓                                                                      │
+│  PermissionNext.ask()                                                       │
+│      ↓                                                                      │
+│  evaluate("bash", "npm test", ruleset)                                      │
+│      ↓                                                                      │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │
+│  │ findLast() 查找匹配规则                                                 │ │
+│  │   - permission: "bash" && pattern: "npm test" → 未匹配                 │ │
+│  │   - permission: "bash" && pattern: "*" → 匹配！action = "allow"        │ │
+│  └───────────────────────────────────────────────────────────────────────┘ │
+│      ↓                                                                      │
+│  rule.action === "allow" → continue (不创建 Promise，不发布事件)            │
+│      ↓                                                                      │
+│  ctx.ask() 立即返回                                                         │
+│      ↓                                                                      │
+│  工具继续执行（无中断）                                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**对比三种 action 的处理**：
+
+| action | 处理方式 | 客户端交互 |
+|--------|---------|-----------|
+| `"allow"` | 直接 continue | 无 |
+| `"deny"` | 抛出 DeniedError | 无（直接失败） |
+| `"ask"` | 创建 Promise，发布事件 | 需要用户确认 |
+
+### 17.14 CLI Run 模式下的权限配置
+
+CLI Run 模式默认会自动拒绝权限请求，但可以通过配置让工具自动执行：
+
+#### 17.14.1 默认行为（自动拒绝）
+
+```typescript
+// run.ts:353-369 - Session 创建时的规则
+const rules: PermissionNext.Ruleset = [
+  { permission: "question", action: "deny", pattern: "*" },
+  { permission: "plan_enter", action: "deny", pattern: "*" },
+  { permission: "plan_exit", action: "deny", pattern: "*" },
+]
+// ★ 没有配置工具的 allow 规则
+
+// run.ts:532-544 - 收到权限请求时
+if (event.type === "permission.asked") {
+  UI.println(`permission requested: ${permission.permission}; auto-rejecting`)
+  await sdk.permission.reply({ requestID: permission.id, reply: "reject" })
+}
+```
+
+**结果**：工具执行被拒绝。
+
+#### 17.14.2 通过配置让工具自动执行
+
+**方法一：opencode.json**
+
+```json
+{
+  "permission": {
+    "*": "allow"
+  }
+}
+```
+
+**方法二：环境变量**
+
+```bash
+OPENCODE_PERMISSION='{"*":"allow"}' opencode run "read package.json"
+```
+
+**方法三：只允许特定工具**
+
+```bash
+OPENCODE_PERMISSION='{"read":"allow","glob":"allow","grep":"allow"}' opencode run "find all ts files"
+```
+
+#### 17.14.3 配置生效后的流程
+
+```
+CLI Run 启动
     ↓
-用户回复 → PermissionNext.reply()
+读取 opencode.json / OPENCODE_PERMISSION
     ↓
-Promise resolve/reject → 工具继续执行或抛出错误
+Config.get() 返回 { permission: { "*": "allow" } }
+    ↓
+Agent 初始化：agent.permission = [...defaults, ...user]
+    ↓
+工具执行 ctx.ask({ permission: "bash", patterns: ["npm test"] })
+    ↓
+evaluate("bash", "npm test", ruleset) → action: "allow"
+    ↓
+★ 不发布 permission.asked 事件
+★ 工具直接继续执行
+    ↓
+不会触发 CLI Run 的 auto-reject 逻辑
+```
+
+### 17.15 完整配置示例
+
+```json
+{
+  "permission": {
+    "bash": {
+      "npm *": "allow",
+      "git *": "allow",
+      "rm -rf *": "deny",
+      "*": "ask"
+    },
+    "edit": {
+      "src/**": "allow",
+      "test/**": "allow",
+      "*.env": "deny",
+      "*": "ask"
+    },
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "websearch": "allow",
+    "webfetch": "allow"
+  }
+}
 ```
 
 ---
