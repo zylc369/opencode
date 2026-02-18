@@ -489,6 +489,12 @@ export async function filterCompacted(stream: AsyncIterable<MessageV2.WithParts>
 **位置**: `src/session/prompt.ts:310-321`
 
 ```typescript
+// 查找最后的用户消息和助手消息
+let lastUser: MessageV2.User | undefined
+let lastAssistant: MessageV2.Assistant | undefined
+let lastFinished: MessageV2.Assistant | undefined
+let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
+// 倒序遍历，可以快速找到最近的消息、收集最近的待处理任务（subtask/compaction）
 for (let i = msgs.length - 1; i >= 0; i--) {
   const msg = msgs[i]
   if (!lastUser && msg.info.role === "user") lastUser = msg.info as MessageV2.User
@@ -664,114 +670,914 @@ if (task?.type === "subtask") {
 
 ## 7. Compaction 上下文压缩
 
-### 7.1 触发条件
+### 7.0 概述：为什么需要 Compaction？
 
-**位置**: `src/session/prompt.ts:548-560`
+大模型有上下文长度限制（如 Claude 的 200K tokens），当对话历史过长时：
+1. **无法继续对话**：超过模型限制会导致 API 报错
+2. **成本增加**：每次请求都发送完整历史，token 消耗巨大
+3. **效率降低**：模型处理大量无关历史信息
+
+Compaction 机制通过**生成对话摘要**来解决这些问题，将长对话压缩为简洁的上下文摘要。
+
+### 7.1 触发条件详解：完整的数据流转链路
+
+理解 `isOverflow` 触发条件，需要追踪两个关键数据的完整流转：
+1. **模型限制** (`model.limit`)：从配置到使用的完整链路
+2. **Token 统计** (`tokens`)：从 API 返回到判断溢出的完整链路
+
+#### 7.1.1 完整调用链路图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    第一步：模型限制数据的获取链路                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  models.dev API                                                                 │
+│  https://models.dev/api.json                                                    │
+│       │                                                                         │
+│       ▼                                                                         │
+│  ModelsDev.get()                                              [src/provider/models.ts:101-104]│
+│  解析 JSON，返回 Provider 列表                                                   │
+│       │                                                                         │
+│       ▼                                                                         │
+│  fromModelsDevModel()                                         [src/provider/provider.ts:669-734]│
+│  提取 model.limit: { context, input, output }                                   │
+│       │                                                                         │
+│       ▼                                                                         │
+│  Provider.getModel(providerID, modelID)                       [获取特定模型]      │
+│       │                                                                         │
+│       ▼                                                                         │
+│  loop() 中的:                                                  [src/session/prompt.ts:350-361]│
+│  const model = await Provider.getModel(lastUser.model.providerID,               │
+│                                        lastUser.model.modelID)  [:350]          │
+│       │                                                                         │
+│       ▼                                                                         │
+│  isOverflow({ tokens, model })                                [:559]            │
+│  └── model.limit.context 被使用                                                 │
+│  └── model.limit.input 被使用                                                   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    第二步：Token 统计数据的获取链路                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  模型 API 响应                                                                   │
+│  Anthropic/OpenAI/etc.                                                          │
+│       │                                                                         │
+│       ▼                                                                         │
+│  Vercel AI SDK: streamText()                                 [src/session/llm.ts:176-260]│
+│  返回 StreamTextResult 对象                                                      │
+│       │                                                                         │
+│       ▼                                                                         │
+│  stream.fullStream                                             [AI SDK 提供]    │
+│  异步迭代器，产生各种事件（text-delta, tool-call, finish-step 等）                │
+│       │                                                                         │
+│       ▼                                                                         │
+│  processor.process() 循环                                     [src/session/processor.ts:55]│
+│  for await (const value of stream.fullStream)                                   │
+│       │                                                                         │
+│       ▼                                                                         │
+│  case "finish-step":                                          [:244-285]        │
+│  ┌─────────────────────────────────────────────────────────────────┐            │
+│  │ const usage = Session.getUsage({                                 │            │
+│  │   model: input.model,                                            │            │
+│  │   usage: value.usage,          // ← 来自 AI SDK 的原始 usage 数据  │            │
+│  │   metadata: value.providerMetadata                               │            │
+│  │ })                                                               │            │
+│  │                                                                  │            │
+│  │ input.assistantMessage.tokens = usage.tokens  // ← 存入消息对象   │            │
+│  │ await Session.updateMessage(input.assistantMessage)  // 持久化   │            │
+│  └─────────────────────────────────────────────────────────────────┘            │
+│       │                                                                         │
+│       ▼                                                                         │
+│  数据库 MessageTable                                                            │
+│  assistantMessage.tokens 被持久化                                               │
+│       │                                                                         │
+│       ▼                                                                         │
+│  下轮 loop() 循环                                                               │
+│  ┌─────────────────────────────────────────────────────────────────┐            │
+│  │ msgs = await MessageV2.filterCompacted(MessageV2.stream())       │            │
+│  │ // 从数据库读取消息历史，包含 tokens 字段                           │            │
+│  │                                                                  │            │
+│  │ for (let i = msgs.length - 1; i >= 0; i--) {                     │            │
+│  │   if (!lastFinished && msg.info.role === "assistant" &&          │            │
+│  │       msg.info.finish)                                           │            │
+│  │     lastFinished = msg.info  // ← 包含 .tokens 属性              │            │
+│  │ }                                                                │            │
+│  └─────────────────────────────────────────────────────────────────┘            │
+│       │                                                                         │
+│       ▼                                                                         │
+│  isOverflow({ tokens: lastFinished.tokens, model })           [:559]            │
+│  └── tokens.total 被使用                                                         │
+│  └── tokens.input/output/cache 被使用                                           │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.1.2 模型限制的配置和读取详解
+
+**配置源头**：`https://models.dev/api.json`
+
+OpenCode 启动时会从 `models.dev` 拉取模型数据库：
 
 ```typescript
-// 检查是否上下文溢出
+// src/provider/models.ts:87-99
+export const Data = lazy(async () => {
+  const file = Bun.file(Flag.OPENCODE_MODELS_PATH ?? filepath)
+  const result = await file.json().catch(() => {})
+  if (result) return result  // 优先使用本地缓存
+  // ...
+  const json = await fetch(`${url()}/api.json`).then((x) => x.text())
+  return JSON.parse(json)
+})
+```
+
+**数据结构**（models.dev 返回）：
+
+```typescript
+// src/provider/models.ts:52-56
+limit: z.object({
+  context: z.number(),    // 总上下文限制，如 200000
+  input: z.number().optional(),   // 输入限制（部分模型有单独限制）
+  output: z.number(),     // 输出限制，如 8192
+})
+```
+
+**转换到内部格式**：
+
+```typescript
+// src/provider/provider.ts:701-705
+limit: {
+  context: model.limit.context,
+  input: model.limit.input,
+  output: model.limit.output,
+}
+```
+
+**使用位置**：在 `loop()` 函数中通过 `lastUser.model` 获取：
+
+```typescript
+// src/session/prompt.ts:350-361
+const model = await Provider.getModel(lastUser.model.providerID, lastUser.model.modelID)
+// model.limit 现在可用
+```
+
+#### 7.1.3 Token 统计的获取详解
+
+**原始来源**：模型 API 的响应
+
+各模型提供商（Anthropic、OpenAI 等）在响应中返回 `usage` 字段：
+
+```json
+{
+  "usage": {
+    "input_tokens": 50000,
+    "output_tokens": 3000,
+    "cache_read_input_tokens": 10000,
+    "cache_creation_input_tokens": 5000
+  }
+}
+```
+
+**Vercel AI SDK 封装**：
+
+AI SDK 将这些数据标准化为 `LanguageModelV2Usage` 类型，并在 `finish-step` 事件中提供：
+
+```typescript
+// AI SDK 内部类型
+interface LanguageModelV2Usage {
+  inputTokens?: number
+  outputTokens?: number
+  reasoningTokens?: number
+  cachedInputTokens?: number
+  totalTokens?: number
+}
+```
+
+**OpenCode 处理**：`Session.getUsage()` 函数将原始 usage 转换为标准格式
+
+```typescript
+// src/session/index.ts:682-758
+export const getUsage = fn(
+  z.object({
+    model: z.custom<Provider.Model>(),
+    usage: z.custom<LanguageModelV2Usage>(),
+    metadata: z.custom<ProviderMetadata>().optional(),
+  }),
+  (input) => {
+    const inputTokens = safe(input.usage.inputTokens ?? 0)
+    const outputTokens = safe(input.usage.outputTokens ?? 0)
+    const reasoningTokens = safe(input.usage.reasoningTokens ?? 0)
+    const cacheReadInputTokens = safe(input.usage.cachedInputTokens ?? 0)
+    const cacheWriteInputTokens = safe(
+      input.metadata?.["anthropic"]?.["cacheCreationInputTokens"] ?? 0
+    )
+
+    // 计算总 token
+    const total = iife(() => {
+      if (input.model.api.npm === "@ai-sdk/anthropic" || ...) {
+        return adjustedInputTokens + outputTokens + cacheReadInputTokens + cacheWriteInputTokens
+      }
+      return input.usage.totalTokens
+    })
+
+    return {
+      cost: /* 根据定价计算 */,
+      tokens: {
+        total,
+        input: adjustedInputTokens,
+        output: outputTokens,
+        reasoning: reasoningTokens,
+        cache: {
+          write: cacheWriteInputTokens,
+          read: cacheReadInputTokens,
+        },
+      },
+    }
+  }
+)
+```
+
+**存储到消息**：
+
+```typescript
+// src/session/processor.ts:250-263
+input.assistantMessage.finish = value.finishReason
+input.assistantMessage.cost += usage.cost
+input.assistantMessage.tokens = usage.tokens  // ← 存入消息
+// ...
+await Session.updateMessage(input.assistantMessage)  // ← 持久化到数据库
+```
+
+**从历史中读取**：
+
+```typescript
+// src/session/prompt.ts:317-322
+for (let i = msgs.length - 1; i >= 0; i--) {
+  const msg = msgs[i]
+  // ...
+  if (!lastFinished && msg.info.role === "assistant" && msg.info.finish)
+    lastFinished = msg.info as MessageV2.Assistant  // ← 包含 .tokens
+}
+```
+
+#### 7.1.4 isOverflow 函数详解
+
+现在我们理解了数据来源，再看 `isOverflow` 函数就清晰了：
+
+```typescript
+// src/session/compaction.ts:32-48
+export async function isOverflow(input: {
+  tokens: MessageV2.Assistant["tokens"]  // ← 来自 lastFinished.tokens
+  model: Provider.Model                   // ← 来自 Provider.getModel()
+}) {
+  const config = await Config.get()
+  if (config.compaction?.auto === false) return false  // 用户禁用了自动压缩
+
+  // 1. 获取模型的总上下文限制
+  const context = input.model.limit.context  // 如 200000
+  if (context === 0) return false  // 某些模型没有限制
+
+  // 2. 计算当前已使用的 token 总数
+  const count =
+    input.tokens.total ||  // 优先使用 total
+    input.tokens.input + input.tokens.output +
+    input.tokens.cache.read + input.tokens.cache.write  // 否则累加各部分
+
+  // 3. 计算需要保留的缓冲空间
+  const reserved = config.compaction?.reserved ??
+    Math.min(COMPACTION_BUFFER, ProviderTransform.maxOutputTokens(input.model))
+  // 默认保留 min(20000, 最大输出tokens) 作为缓冲
+
+  // 4. 计算总共可用的输入空间上限
+  const usable = input.model.limit.input
+    ? input.model.limit.input - reserved      // 如果有单独的输入限制
+    : context - ProviderTransform.maxOutputTokens(input.model)  // 否则用总限制减输出
+
+  // 5. 判断是否溢出
+  return count >= usable  // 当前使用量 >= 可用空间 → 需要压缩
+}
+```
+
+**关键变量含义**：
+
+```typescript
+const count = input.tokens.total || ...  // count: 当前已使用的 token 总数
+const usable = ...                        // usable: 可用输入空间的上限（阈值）
+return count >= usable                    // 已使用量 >= 上限 → 需要压缩
+```
+
+**注意**：`usable` 是"总共可用的输入空间上限"，**不是"剩余可用空间"**。
+
+| 变量 | 含义 | 类比 |
+|------|------|------|
+| `count` | 当前已使用量 | 水桶里已有的水量 |
+| `usable` | 可用空间上限 | 水桶的安全容量线 |
+| `usable - count` | 剩余可用空间 | 还能装多少水 |
+
+**为什么需要保留缓冲空间？**
+
+**核心原因**：如果输入 tokens + 预期输出 tokens > 模型上下文限制，大模型 API 会直接报错（如 `context_length_exceeded`），导致对话中断。
+
+所以必须在接近边界**之前**主动压缩，为输出预留空间。
+
+**两种模型限制模式**：
+
+不同模型对上下文的限制方式不同，因此计算 `usable` 的逻辑也不同：
+
+| 模式 | 限制方式 | 例子 | 特点 |
+|------|---------|------|------|
+| 情况1 | 输入/输出分别限制 | input=180K, output=8K | 两个独立限制 |
+| 情况2 | 总上下文限制 | context=200K | 输入+输出共享池子 |
+
+```typescript
+const usable = input.model.limit.input
+  ? input.model.limit.input - reserved           // 情况1：有单独的输入限制
+  : context - ProviderTransform.maxOutputTokens(input.model)  // 情况2：无单独限制
+```
+
+**情况1详解**：模型有单独的输入限制
+
+```
+input.limit = 180000  （输入最多 180K）
+output.limit = 8192   （输出最多 8K）
+```
+
+为什么用 `input.limit - reserved`？
+
+| 计算方式 | usable 值 | 触发压缩时机 |
+|---------|-----------|-------------|
+| 不减 reserved | 180000 | count >= 180000 时 |
+| 减 reserved (20000) | 160000 | count >= 160000 时 |
+
+**减 reserved 的目的**：在真正达到输入限制**之前**就压缩，留出安全余量：
+1. 新消息可能随时进来
+2. 避免"刚好踩线"的风险
+3. Token 计数可能有误差
+
+**情况2详解**：模型只有总上下文限制
+
+```
+context = 200000      （输入+输出 总共 200K）
+output.limit = 8192
+```
+
+为什么用 `context - maxOutputTokens` 而不再减 reserved？
+
+因为 `maxOutputTokens` 本身已经是一个"安全"的缓冲值，它代表了模型最大能输出的 token 数，足够容纳任何合法的输出。
+
+```
+总上下文空间 (context: 200000)
+├── 可用输入空间 = context - maxOutputTokens (如 200000 - 8192 = 191808)
+│   └── 当 count >= 191808 时触发压缩
+└── 输出预留空间 (maxOutputTokens: 8192)
+    └── 确保模型有足够空间生成响应
+```
+
+**两种情况的本质相同**：都是在"边界之前"触发压缩，只是计算边界的方式因模型限制模式不同而异。
+
+#### 7.1.5 触发条件的完整逻辑
+
+**位置**: `src/session/prompt.ts:556-568`
+
+```typescript
 if (
-  lastFinished &&
-  lastFinished.summary !== true &&
+  lastFinished &&                          // 条件1: 存在已完成的助手消息
+  lastFinished.summary !== true &&         // 条件2: 不是压缩摘要消息本身
   (await SessionCompaction.isOverflow({ tokens: lastFinished.tokens, model }))
-) {
+)                                          // 条件3: token 超出可用空间
+{
   await SessionCompaction.create({
     sessionID,
     agent: lastUser.agent,
     model: lastUser.model,
-    auto: true,
+    auto: true,  // 标记为自动压缩
   })
+  continue  // 跳过本轮，下轮循环会处理 compaction part
+}
+```
+
+**三个条件的含义**：
+
+| 条件 | 含义 | 为什么需要 |
+|------|------|-----------|
+| `lastFinished` | 存在已完成的助手消息 | 需要有 token 统计数据才能判断 |
+| `lastFinished.summary !== true` | 不是压缩摘要消息 | 压缩消息本身不应该再触发压缩 |
+| `isOverflow(...)` | token 超出可用空间 | 实际的溢出判断 |
+
+**注意**：`Token.estimate()` 函数**不用于判断溢出**，只在 `prune` 函数中用于估算工具调用输出的 token 数。
+
+### 7.2 Compaction 创建流程
+
+#### 7.2.1 SessionCompaction.create 函数
+
+**位置**: `src/session/compaction.ts:231-260`
+
+```typescript
+export const create = fn(
+  z.object({
+    sessionID: Identifier.schema("session"),
+    agent: z.string(),
+    model: z.object({ providerID: z.string(), modelID: z.string() }),
+    auto: z.boolean(),
+  }),
+  async (input) => {
+    // 1. 创建用户消息
+    const msg = await Session.updateMessage({
+      id: Identifier.ascending("message"),
+      role: "user",
+      model: input.model,
+      sessionID: input.sessionID,
+      agent: input.agent,
+      time: { created: Date.now() },
+    })
+
+    // 2. 创建 compaction part
+    await Session.updatePart({
+      id: Identifier.ascending("part"),
+      messageID: msg.id,
+      sessionID: msg.sessionID,
+      type: "compaction",
+      auto: input.auto,  // 记录是否自动压缩
+    })
+  },
+)
+```
+
+**执行结果**：
+- 向 `message` 表插入**一条**用户消息
+- 向 `part` 表插入**一条** `compaction` 类型的 part
+
+#### 7.2.2 循环如何获取 compaction 数据
+
+`continue` 后，下轮循环开始时：
+
+```typescript
+let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+```
+
+`MessageV2.stream()` 从数据库读取所有消息（包括刚插入的 compaction 消息），然后 `filterCompacted` 过滤已压缩的历史。
+
+#### 7.2.3 tasks 数组的收集
+
+**位置**: `src/session/prompt.ts:315-328`
+
+```typescript
+let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
+
+for (let i = msgs.length - 1; i >= 0; i--) {
+  const msg = msgs[i]
+  // ... 查找 lastUser, lastAssistant, lastFinished
+
+  // 收集未完成前的所有 compaction/subtask parts
+  const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
+  if (task && !lastFinished) {
+    tasks.push(...task)
+  }
+}
+
+const task = tasks.pop()  // 取最新一个待处理任务
+```
+
+**所有 compaction part 都通过 `SessionCompaction.create` 插入**，没有其他来源。
+
+### 7.3 Compaction 处理流程
+
+#### 7.3.1 处理入口
+
+**位置**: `src/session/prompt.ts:543-553`
+
+```typescript
+if (task?.type === "compaction") {
+  const result = await SessionCompaction.process({
+    messages: msgs,
+    parentID: lastUser.id,
+    abort,
+    sessionID,
+    auto: task.auto,  // 从 part 中读取 auto 标记
+  })
+  if (result === "stop") break
   continue
 }
 ```
 
-**位置**: `src/session/compaction.ts:32-48`
+#### 7.3.2 task 的含义
 
-```typescript
-export async function isOverflow(input: { tokens: MessageV2.Assistant["tokens"]; model: Provider.Model }) {
-  const config = await Config.get()
-  if (config.compaction?.auto === false) return false
+1. **`task = tasks.pop()`**：取出最新一条待处理的 part（compaction 或 subtask）
+2. **`task.auto`**：标记这是**自动触发**还是**手动触发**的压缩
+   - `true`：由 `isOverflow` 自动触发
+   - `false`：用户手动调用 `/compact` 命令
 
-  const context = input.model.limit.context
-  if (context === 0) return false
+#### 7.3.3 为什么传递 msgs 而不是 task
 
-  const count = input.tokens.total ||
-    input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
+`SessionCompaction.process` 需要：
+- **完整的历史消息** `msgs`：用于生成对话摘要
+- **不需要 task 参数**：因为 `parentID` 已经标识了触发压缩的用户消息
 
-  const reserved = config.compaction?.reserved ??
-    Math.min(COMPACTION_BUFFER, ProviderTransform.maxOutputTokens(input.model))
+`task` 只是用于判断类型和读取 `auto` 标记，处理函数内部通过 `parentID` 找到对应的用户消息。
 
-  const usable = input.model.limit.input
-    ? input.model.limit.input - reserved
-    : context - ProviderTransform.maxOutputTokens(input.model)
+### 7.4 SessionCompaction.process 函数详解
 
-  return count >= usable
-}
-```
-
-### 7.2 Compaction 处理逻辑
+#### 7.4.1 函数签名
 
 **位置**: `src/session/compaction.ts:101-229`
 
 ```typescript
 export async function process(input: {
-  parentID: string
-  messages: MessageV2.WithParts[]
+  parentID: string              // 触发压缩的用户消息 ID
+  messages: MessageV2.WithParts[]  // 完整历史消息
   sessionID: string
   abort: AbortSignal
-  auto: boolean
-}) {
-  const userMessage = input.messages.findLast((m) => m.info.id === input.parentID)!.info as MessageV2.User
-  const agent = await Agent.get("compaction")
+  auto: boolean                 // 是否自动压缩
+})
+```
 
-  // 1. 创建压缩消息
-  const msg = await Session.updateMessage({
+#### 7.4.2 compacting.prompt 和 compacting.context 的生成
+
+```typescript
+// 1. 允许插件注入或修改压缩提示词
+const compacting = await Plugin.trigger(
+  "experimental.session.compacting",
+  { sessionID: input.sessionID },
+  { context: [], prompt: undefined },  // 默认值
+)
+
+// 2. 默认提示词模板
+const defaultPrompt = `Provide a detailed prompt for continuing our conversation above.
+Focus on information that would be helpful for continuing the conversation...
+
+When constructing the summary, try to stick to this template:
+---
+## Goal
+[What goal(s) is the user trying to accomplish?]
+
+## Instructions
+[What important instructions did the user give you...]
+
+## Discoveries
+[What notable things were learned...]
+
+## Accomplished
+[What work has been completed...]
+
+## Relevant files / directories
+[Construct a structured list of relevant files...]
+---`
+
+// 3. 合并提示词
+const promptText = compacting.prompt ?? [defaultPrompt, ...compacting.context].join("\n\n")
+```
+
+**生成逻辑**：
+- 如果插件提供了 `prompt`，使用插件的
+- 否则使用 `defaultPrompt` + 插件提供的 `context` 数组
+
+#### 7.4.3 压缩摘要的生成
+
+```typescript
+// 1. 找到触发压缩的用户消息
+const userMessage = input.messages.findLast((m) => m.info.id === input.parentID)!.info
+
+// 2. 获取 compaction agent
+const agent = await Agent.get("compaction")
+
+// 3. 创建助手消息（用于存放摘要）
+const msg = await Session.updateMessage({
+  id: Identifier.ascending("message"),
+  role: "assistant",
+  parentID: input.parentID,
+  sessionID: input.sessionID,
+  mode: "compaction",
+  agent: "compaction",
+  summary: true,  // ★ 关键：标记为压缩摘要消息
+  // ...
+})
+
+// 4. 调用模型生成摘要
+const processor = SessionProcessor.create({ assistantMessage: msg, ... })
+
+const result = await processor.process({
+  user: userMessage,
+  agent,
+  messages: [
+    ...MessageV2.toModelMessages(input.messages, model),  // 历史消息
+    { role: "user", content: [{ type: "text", text: promptText }] },  // 压缩提示
+  ],
+  tools: {},  // 压缩时不使用工具
+  system: [],
+  model,
+})
+```
+
+#### 7.4.4 result === "continue" 的情况
+
+`processor.process()` 返回 `"continue"` 的条件：
+
+**位置**: `src/session/processor.ts:412-415`
+
+```typescript
+if (needsCompaction) return "compact"
+if (blocked) return "stop"
+if (input.assistantMessage.error) return "stop"
+return "continue"  // ★ 默认返回 continue
+```
+
+**返回 "continue"**：模型正常完成摘要生成，没有错误，没有被阻止。
+
+#### 7.4.5 result === "continue" && input.auto 的处理
+
+```typescript
+if (result === "continue" && input.auto) {
+  // 1. 创建新的用户消息
+  const continueMsg = await Session.updateMessage({
     id: Identifier.ascending("message"),
-    role: "assistant",
-    parentID: input.parentID,
+    role: "user",
     sessionID: input.sessionID,
-    mode: "compaction",
-    agent: "compaction",
-    summary: true,  // 标记为总结消息
-    // ...
+    agent: userMessage.agent,
+    model: userMessage.model,
+    time: { created: Date.now() },
   })
 
-  // 2. 使用 compaction agent 生成摘要
-  const processor = SessionProcessor.create({...})
-
-  const defaultPrompt = `Provide a detailed prompt for continuing our conversation above.
-Focus on information that would be helpful for continuing the conversation, including what we did,
-what we're doing, which files we're working on, and what we're going to do next.
-...`
-
-  const result = await processor.process({
-    user: userMessage,
-    agent,
-    messages: [
-      ...MessageV2.toModelMessages(input.messages, model),
-      { role: "user", content: [{ type: "text", text: promptText }] },
-    ],
-    // ...
+  // 2. 创建文本 part
+  await Session.updatePart({
+    id: Identifier.ascending("part"),
+    messageID: continueMsg.id,
+    sessionID: input.sessionID,
+    type: "text",
+    synthetic: true,  // ★ 标记为合成消息
+    text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+    time: { start: Date.now(), end: Date.now() },
   })
-
-  // 3. 如果是自动压缩，添加继续消息
-  if (result === "continue" && input.auto) {
-    const continueMsg = await Session.updateMessage({
-      role: "user",
-      // ...
-      text: "Continue if you have next steps, or stop and ask for clarification...",
-    })
-  }
-
-  return "continue"
 }
 ```
 
-### 7.3 Compaction 的作用
+**"stop and ask for clarification" 如何工作？**
 
-1. **减少上下文长度**: 当 token 数接近模型限制时触发
-2. **生成摘要**: 使用 `compaction` agent 生成对话摘要
-3. **标记分界点**: `summary: true` 标记压缩点，`filterCompacted` 会在此截断历史
+这段文本是发送给**模型**的提示，不是给用户的。流程如下：
+
+```
+1. compaction 完成后，loop 继续循环
+2. filterCompacted 读取消息，在 summary: true 的助手消息处截断
+3. 新一轮处理时，模型看到：
+   - 压缩摘要（summary 消息）
+   - "Continue if you have next steps..." 提示
+4. 模型根据提示决定：
+   - 继续执行下一步
+   - 或停下来询问用户（通过 question 工具或直接 finish: "stop"）
+```
+
+**不是强制暂停**，而是让模型自己判断是否需要用户确认。
+
+#### 7.4.6 updateMessage 和 updatePart 的行为
+
+**位置**: `src/session/index.ts:581-601` 和 `src/session/index.ts:646-666`
+
+```typescript
+// 使用 SQLite 的 UPSERT 语法
+db.insert(MessageTable)
+  .values({...})
+  .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
+  .run()
+```
+
+**行为**：
+- **新 ID**：插入新记录
+- **已存在的 ID**：更新现有记录
+
+**在 compaction 中的使用**：
+- 创建的压缩摘要消息使用新 ID，所以是**插入**
+- 后续循环通过 `MessageV2.stream()` 读取到这些新数据
+
+#### 7.4.7 processor.message.error 什么时候不为空
+
+**位置**: `src/session/processor.ts:350-377`
+
+```typescript
+} catch (e: any) {
+  const error = MessageV2.fromError(e, { providerID: input.model.providerID })
+
+  // 如果不是可重试的错误
+  const retry = Session_retry.retryable(error)
+  if (retry !== undefined) {
+    // 重试逻辑...
+    continue
+  }
+
+  // 记录错误
+  input.assistantMessage.error = error
+  Bus.publish(Session.Event.Error, { sessionID, error })
+  SessionStatus.set(sessionID, { type: "idle" })
+}
+
+// 返回检查
+if (input.assistantMessage.error) return "stop"
+```
+
+**error 不为空的情况**：
+1. **API 调用失败**：网络错误、认证错误、速率限制等
+2. **上下文溢出**：`ContextOverflowError`
+3. **输出长度超限**：`OutputLengthError`
+4. **用户中止**：`AbortedError`
+5. **其他不可重试的错误**
+
+**可重试的错误不会导致 stop**，会自动重试。
+
+### 7.5 压实的是什么数据
+
+#### 7.5.1 压实的粒度
+
+**压实的是对话历史，通过 Message 的 `summary` 字段标记分界点。**
+
+不是删除或修改原始数据，而是：
+1. **创建新的摘要消息**（`summary: true` 的助手消息）
+2. **`filterCompacted` 读取时截断历史**
+
+#### 7.5.2 filterCompacted 的工作原理
+
+**位置**: `src/session/message-v2.ts:794-813`
+
+```typescript
+export async function filterCompacted(stream: AsyncIterable<MessageV2.WithParts>) {
+  const result = [] as MessageV2.WithParts[]
+  const completed = new Set<string>()
+
+  for await (const msg of stream) {
+    result.push(msg)
+
+    // 情况1: 遇到 compaction part，且其父消息已完成 → 停止收集
+    if (
+      msg.info.role === "user" &&
+      completed.has(msg.info.id) &&
+      msg.parts.some((part) => part.type === "compaction")
+    )
+      break
+
+    // 情况2: 助手消息有 summary 和 finish → 标记父消息完成
+    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish)
+      completed.add(msg.info.parentID)
+  }
+
+  result.reverse()
+  return result
+}
+```
+
+**工作流程**：
+1. 倒序遍历消息（最新在前）
+2. 遇到 `summary: true && finish` 的助手消息 → 记录其 `parentID`
+3. 遇到用户消息有 `compaction` part 且 `parentID` 已完成 → 停止
+4. 反转返回（时间正序）
+
+#### 7.5.3 压实后的数据结构
+
+```
+压缩前的历史（被截断，不发送给模型）:
+┌─────────────────────────────────────────┐
+│ User: "帮我实现功能A"                     │
+│ Assistant: "好的，我来..."               │
+│ User: "继续"                             │
+│ Assistant: "功能A已完成..."              │
+│ ...（大量历史）                           │
+└─────────────────────────────────────────┘
+
+压缩后发送给模型的历史:
+┌─────────────────────────────────────────┐
+│ User: [compaction part]                 │
+│ Assistant (summary: true):              │
+│   "## Goal                              │
+│    实现功能A                             │
+│    ## Accomplished                      │
+│    功能A已完成...                        │
+│    ## Next                              │
+│    需要继续实现功能B..."                  │
+│ User (synthetic):                       │
+│   "Continue if you have next steps..."  │
+└─────────────────────────────────────────┘
+```
+
+#### 7.5.4 为什么需要 summary 和 finish 两个条件
+
+```typescript
+if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish)
+  completed.add(msg.info.parentID)
+```
+
+- **`summary: true`**：标记这是压缩摘要消息
+- **`finish`**：确保模型已经完成摘要生成（不是中断的）
+
+两个条件都满足，才认为这个压缩点是有效的，可以截断历史。
+
+### 7.6 完整的 Compaction 流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          loop() 主循环                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. 检查是否触发压缩                                                     │
+│     ┌──────────────────────────────────────────────────────────────┐   │
+│     │ if (lastFinished &&                                          │   │
+│     │     lastFinished.summary !== true &&                         │   │
+│     │     isOverflow({ tokens, model }))                           │   │
+│     │ {                                                            │   │
+│     │   SessionCompaction.create({ auto: true })                   │   │
+│     │   continue                                                   │   │
+│     │ }                                                            │   │
+│     └──────────────────────────────────────────────────────────────┘   │
+│                              ↓                                          │
+│  2. 下轮循环检测到 compaction part                                       │
+│     ┌──────────────────────────────────────────────────────────────┐   │
+│     │ if (task?.type === "compaction")                             │   │
+│     │   SessionCompaction.process({ auto: task.auto })             │   │
+│     └──────────────────────────────────────────────────────────────┘   │
+│                              ↓                                          │
+│  3. process() 内部                                                       │
+│     ┌──────────────────────────────────────────────────────────────┐   │
+│     │ a. 创建 summary: true 的助手消息                              │   │
+│     │ b. 调用 compaction agent 生成摘要                             │   │
+│     │ c. 如果 auto，创建 "Continue..." 合成用户消息                  │   │
+│     │ d. return "continue"                                          │   │
+│     └──────────────────────────────────────────────────────────────┘   │
+│                              ↓                                          │
+│  4. 下轮循环 filterCompacted() 截断历史                                  │
+│     ┌──────────────────────────────────────────────────────────────┐   │
+│     │ 只返回:                                                       │   │
+│     │   - 压缩摘要消息                                              │   │
+│     │   - "Continue..." 用户消息                                    │   │
+│     │   - 压缩后的新消息                                            │   │
+│     └──────────────────────────────────────────────────────────────┘   │
+│                              ↓                                          │
+│  5. 正常处理流程继续...                                                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.7 prune 函数：清理旧工具输出
+
+**位置**: `src/session/compaction.ts:58-99`
+
+除了压缩摘要，还有一个 `prune` 函数用于清理旧的工具调用输出：
+
+```typescript
+export async function prune(input: { sessionID: string }) {
+  // 从后向前遍历，保留最近 40000 tokens 的工具输出
+  for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
+    for (let partIndex = msg.parts.length - 1; partIndex >= 0; partIndex--) {
+      const part = msg.parts[partIndex]
+      if (part.type === "tool" && part.state.status === "completed") {
+        const estimate = Token.estimate(part.state.output)
+        total += estimate
+        if (total > PRUNE_PROTECT) {  // 40000
+          toPrune.push(part)
+        }
+      }
+    }
+  }
+
+  // 标记为已压缩（输出会被替换为 "[Old tool result content cleared]"）
+  for (const part of toPrune) {
+    part.state.time.compacted = Date.now()
+    await Session.updatePart(part)
+  }
+}
+```
+
+**与 compaction 的区别**：
+- **compaction**：生成对话摘要，通过 `summary` 标记截断历史
+- **prune**：清理旧工具输出，减少上下文中的冗余内容
+
+### 7.8 配置选项
+
+```json
+{
+  "compaction": {
+    "auto": true,      // 是否自动压缩（默认 true）
+    "reserved": 20000, // 保留的缓冲空间（默认 min(20000, maxOutputTokens)）
+    "prune": true      // 是否启用工具输出清理（默认 true）
+  }
+}
+```
+
+### 7.9 总结
+
+| 问题 | 答案 |
+|------|------|
+| 模型限制在哪里配置 | `models.dev` 数据库 + 本地 `opencode.json` 覆盖 |
+| 限制针对什么 | **整个对话历史**，通过最近助手消息的 `tokens` 统计 |
+| Token 如何计算 | **API 返回的实际值**，不是字符估算 |
+| create 做什么 | 插入一条用户消息 + 一条 compaction part |
+| 循环如何获取 | `filterCompacted` 从数据库读取，检测 compaction part |
+| task 来自哪里 | **只有 create 插入**，没有其他来源 |
+| task.auto 含义 | 标记是**自动**还是**手动**触发压缩 |
+| 为什么传 msgs | 需要**完整历史**来生成摘要 |
+| prompt 如何生成 | 默认模板 + 插件可覆盖/扩展 |
+| result === "continue" | 模型正常完成，无错误 |
+| "stop and ask" | 发送给**模型**的提示，让模型决定是否需要用户确认 |
+| update 行为 | **Upsert**（插入或更新），compaction 中是插入新数据 |
+| error 何时非空 | API 错误、中止、溢出等**不可恢复错误** |
+| 压实什么 | **Message**（通过 `summary` 标记），不删除原始数据 |
+| 压实后效果 | `filterCompacted` 只返回压缩点之后的历史 |
 
 ---
 
@@ -1060,6 +1866,7 @@ if (
   !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
   lastUser.id < lastAssistant.id
 ) {
+  // 模型已完成，退出循环
   log.info("exiting loop", { sessionID })
   break
 }
