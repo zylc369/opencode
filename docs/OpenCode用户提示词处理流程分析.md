@@ -3300,6 +3300,801 @@ export type Context = {
 }
 ```
 
+### 11.4 工具执行流程
+
+**触发条件**：当模型返回 `tool-call` 事件时，AI SDK 会自动调用工具的 `execute` 函数。
+
+**代码位置**：
+
+| 阶段 | 位置 | 作用 |
+|------|------|------|
+| 事件处理 | `src/session/processor.ts:134-179` | 处理 `tool-call` 事件，更新状态为 "running" |
+| 工具执行 | `src/session/prompt.ts:806-839` | 定义工具的 `execute` 函数 |
+| 结果处理 | `src/session/processor.ts:180-202` | 处理 `tool-result` 事件，更新状态为 "completed" |
+
+**完整流程图**：
+
+```
+模型返回 tool-call 事件
+    ↓
+processor.ts 检测到 tool-call
+    ↓
+更新 part 状态为 "running"
+    ↓
+AI SDK 自动调用 tools[name].execute()
+    ↓
+工具执行完成，返回结果
+    ↓
+AI SDK 发出 tool-result 事件
+    ↓
+processor.ts 更新 part 状态为 "completed"
+    ↓
+下一轮循环，结果作为消息发送给模型
+```
+
+**工具执行代码**（`src/session/prompt.ts:806-839`）：
+
+```typescript
+tools[item.id] = tool({
+  id: item.id,
+  description: item.description,
+  inputSchema: jsonSchema(schema),
+  async execute(args, options) {
+    const ctx = context(args, options)
+    // 执行前触发插件
+    await Plugin.trigger("tool.execute.before", { tool: item.id, ... }, { args })
+
+    // 执行工具
+    const result = await item.execute(args, ctx)
+
+    // 处理附件
+    const output = {
+      ...result,
+      attachments: result.attachments?.map((attachment) => ({
+        ...attachment,
+        id: Identifier.ascending("part"),
+        sessionID: ctx.sessionID,
+        messageID: input.processor.message.id,
+      })),
+    }
+
+    // 执行后触发插件
+    await Plugin.trigger("tool.execute.after", { tool: item.id, ... }, output)
+    return output
+  }
+})
+```
+
+### 11.5 WebSearch 工具详解
+
+**位置**：`src/tool/websearch.ts`
+
+#### 11.5.1 触发条件
+
+当模型调用 `websearch` 工具时（即模型返回 `tool-call` 且 `toolName === "websearch"`）。
+
+#### 11.5.2 工具定义
+
+```typescript
+export const WebSearchTool = Tool.define("websearch", async () => {
+  return {
+    description: "...",
+    parameters: z.object({
+      query: z.string().describe("Websearch query"),
+      numResults: z.number().optional().describe("Number of results (default: 8)"),
+      livecrawl: z.enum(["fallback", "preferred"]).optional(),
+      type: z.enum(["auto", "fast", "deep"]).optional(),
+      contextMaxCharacters: z.number().optional(),
+    }),
+    async execute(params, ctx) {
+      // 1. 权限检查
+      await ctx.ask({ permission: "websearch", patterns: [params.query] })
+
+      // 2. 调用 Exa API
+      const response = await fetch("https://mcp.exa.ai/mcp", {
+        method: "POST",
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "tools/call",
+          params: {
+            name: "web_search_exa",
+            arguments: { query: params.query, type: "auto", numResults: 8 }
+          }
+        })
+      })
+
+      // 3. 解析 SSE 响应
+      const data = JSON.parse(line.substring(6))
+      return {
+        output: data.result.content[0].text,  // 搜索结果文本
+        title: `Web search: ${params.query}`,
+        metadata: {},
+      }
+    }
+  }
+})
+```
+
+#### 11.5.3 返回结果结构
+
+```typescript
+interface ToolResult {
+  output: string      // 搜索结果文本（已格式化）
+  title: string       // 标题："Web search: xxx"
+  metadata: object    // 元数据
+  attachments?: []    // 可选附件
+}
+```
+
+**`output` 字段内容**：Exa API 返回的搜索结果，是**文本格式**（非 JSON）。
+
+**示例输出**：
+
+```
+Search results for "TypeScript tutorial":
+
+1. TypeScript: The starting point for learning TypeScript
+   https://www.typescriptlang.org/docs/
+   TypeScript is a strongly typed programming language...
+
+2. TypeScript Tutorial - W3Schools
+   https://www.w3schools.com/typescript/
+   Learn TypeScript with examples...
+```
+
+#### 11.5.4 结果处理流程
+
+**1. 结果存储**（`src/session/processor.ts:180-202`）：
+
+```typescript
+case "tool-result": {
+  await Session.updatePart({
+    state: {
+      status: "completed",
+      input: value.input,           // 工具输入参数
+      output: value.output.output,   // 工具输出结果（搜索文本）
+      metadata: value.output.metadata,
+      title: value.output.title,
+      attachments: value.output.attachments,
+      time: { start, end }
+    }
+  })
+}
+```
+
+**2. 数据加工**（`src/session/prompt.ts:820-828`）：
+
+```typescript
+const result = await item.execute(args, ctx)
+const output = {
+  ...result,
+  // 处理附件，添加 ID
+  attachments: result.attachments?.map((attachment) => ({
+    ...attachment,
+    id: Identifier.ascending("part"),
+    sessionID: ctx.sessionID,
+    messageID: input.processor.message.id,
+  })),
+}
+```
+
+**3. 传递给模型**（`src/session/message-v2.ts`）：
+
+```typescript
+// 转换后的消息格式
+{
+  role: "tool",
+  content: [{
+    type: "tool-result",
+    toolCallId: "xxx",
+    toolName: "websearch",
+    result: "搜索结果文本..."  // ← WebSearch 的 output
+  }]
+}
+```
+
+**4. 完整流程图**：
+
+```
+模型调用 websearch 工具
+    ↓
+AI SDK 调用 WebSearchTool.execute()
+    ↓
+调用 Exa API 获取搜索结果
+    ↓
+返回 { output: "搜索结果文本", title: "...", metadata: {} }
+    ↓
+AI SDK 发出 tool-result 事件
+    ↓
+processor.ts 存储结果到 part.state.output
+    ↓
+loop 继续循环
+    ↓
+MessageV2.toModelMessages() 转换消息
+    ↓
+工具结果作为 tool-result 消息发送给模型
+    ↓
+模型看到搜索结果，生成最终回复
+```
+
+### 11.6 工具调用完整代码链路
+
+本节从代码层面完整追踪一个工具调用从注册到执行到返回结果的全过程。
+
+#### 11.6.1 代码链路总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            工具调用完整链路                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 工具注册                                                                 │
+│     Tool.define("websearch", ...)        [src/tool/websearch.ts:40-150]     │
+│     ToolRegistry.tools() 返回所有工具      [src/tool/registry.ts]            │
+│                                                                             │
+│  2. 工具解析                                                                 │
+│     resolveTools() → 构建 AI SDK Tool 对象 [src/session/prompt.ts:750-842]  │
+│                                                                             │
+│  3. 传递给 LLM                                                               │
+│     LLM.stream({ tools })                [src/session/llm.ts:46-260]        │
+│     streamText({ tools })                [src/session/llm.ts:176-260]       │
+│                                                                             │
+│  4. 模型响应工具调用                                                          │
+│     fullStream → "tool-call" 事件         [AI SDK]                          │
+│                                                                             │
+│  5. 事件处理                                                                 │
+│     processor.process() 处理 tool-call    [src/session/processor.ts:134-179]│
+│     更新 part 状态为 "running"                                               │
+│                                                                             │
+│  6. 工具执行                                                                 │
+│     AI SDK 调用 execute()                [src/session/prompt.ts:806-839]    │
+│     item.execute(args, ctx)              [src/tool/websearch.ts:65-148]     │
+│                                                                             │
+│  7. 结果处理                                                                 │
+│     fullStream → "tool-result" 事件       [AI SDK]                          │
+│     更新 part 状态为 "completed"          [src/session/processor.ts:180-202]│
+│                                                                             │
+│  8. 结果发送给模型                                                           │
+│     toModelMessages() 转换               [src/session/message-v2.ts]        │
+│     下一轮循环作为 tool-result 消息发送                                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 11.6.2 第一步：工具定义和注册
+
+**工具定义**（`src/tool/tool.ts:48-88`）：
+
+```typescript
+export function define<Parameters extends z.ZodType, Result extends Metadata>(
+  id: string,
+  init: Info<Parameters, Result>["init"] | Awaited<ReturnType<Info<Parameters, Result>["init"]>>,
+): Info<Parameters, Result> {
+  return {
+    id,
+    init: async (initCtx) => {
+      const toolInfo = init instanceof Function ? await init(initCtx) : init
+      const execute = toolInfo.execute
+      // 包装 execute：添加参数校验和输出截断
+      toolInfo.execute = async (args, ctx) => {
+        try {
+          toolInfo.parameters.parse(args)  // Zod 校验
+        } catch (error) {
+          if (error instanceof z.ZodError && toolInfo.formatValidationError) {
+            throw new Error(toolInfo.formatValidationError(error), { cause: error })
+          }
+          throw new Error(`The ${id} tool was called with invalid arguments: ${error}.`, { cause: error })
+        }
+        const result = await execute(args, ctx)
+        // 自动截断过长输出
+        const truncated = await Truncate.output(result.output, {}, initCtx?.agent)
+        return {
+          ...result,
+          output: truncated.content,
+          metadata: { ...result.metadata, truncated: truncated.truncated },
+        }
+      }
+      return toolInfo
+    },
+  }
+}
+```
+
+**具体工具示例**（`src/tool/websearch.ts:40-150`）：
+
+```typescript
+export const WebSearchTool = Tool.define("websearch", async () => {
+  return {
+    get description() {
+      return DESCRIPTION.replace("{{year}}", new Date().getFullYear().toString())
+    },
+    parameters: z.object({
+      query: z.string().describe("Websearch query"),
+      numResults: z.number().optional(),
+      // ...
+    }),
+    async execute(params, ctx) {
+      // 1. 权限请求
+      await ctx.ask({
+        permission: "websearch",
+        patterns: [params.query],
+        always: ["*"],
+        metadata: { query: params.query, ... },
+      })
+
+      // 2. 构建请求
+      const searchRequest: McpSearchRequest = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "web_search_exa",
+          arguments: { query: params.query, type: params.type || "auto", ... },
+        },
+      }
+
+      // 3. 调用 Exa API
+      const response = await fetch(`${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.SEARCH}`, {
+        method: "POST",
+        headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+        body: JSON.stringify(searchRequest),
+        signal,
+      })
+
+      // 4. 解析 SSE 响应
+      const lines = responseText.split("\n")
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const data: McpSearchResponse = JSON.parse(line.substring(6))
+          if (data.result && data.result.content && data.result.content.length > 0) {
+            return {
+              output: data.result.content[0].text,  // 搜索结果
+              title: `Web search: ${params.query}`,
+              metadata: {},
+            }
+          }
+        }
+      }
+
+      return { output: "No search results found.", title: `Web search: ${params.query}`, metadata: {} }
+    },
+  }
+})
+```
+
+#### 11.6.3 第二步：resolveTools 构建 AI SDK 工具对象
+
+**位置**：`src/session/prompt.ts:750-842`
+
+```typescript
+export async function resolveTools(input: {
+  agent: Agent.Info
+  model: Provider.Model
+  session: Session.Info
+  tools?: Record<string, boolean>
+  processor: SessionProcessor.Info
+  bypassAgentCheck: boolean
+  messages: MessageV2.WithParts[]
+}) {
+  const tools: Record<string, AITool> = {}
+
+  // 创建工具执行上下文
+  const context = (args: any, options: ToolCallOptions): Tool.Context => ({
+    sessionID: input.session.id,
+    abort: options.abortSignal!,
+    messageID: input.processor.message.id,
+    callID: options.toolCallId,
+    extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck },
+    agent: input.agent.name,
+    messages: input.messages,
+    // 元数据更新回调
+    metadata: async (val: { title?: string; metadata?: any }) => {
+      const match = input.processor.partFromToolCall(options.toolCallId)
+      if (match && match.state.status === "running") {
+        await Session.updatePart({
+          ...match,
+          state: { title: val.title, metadata: val.metadata, status: "running", input: args, time: { start: Date.now() } },
+        })
+      }
+    },
+    // 权限请求
+    async ask(req) {
+      await PermissionNext.ask({
+        ...req,
+        sessionID: input.session.id,
+        tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+        ruleset: PermissionNext.merge(input.agent.permission, input.session.permission ?? []),
+      })
+    },
+  })
+
+  // 遍历所有已注册工具
+  for (const item of await ToolRegistry.tools({ modelID: input.model.api.id, providerID: input.model.providerID }, input.agent)) {
+    // 适配 JSON Schema
+    const schema = ProviderTransform.schema(input.model, z.toJSONSchema(item.parameters))
+
+    // 构建 AI SDK 工具对象
+    tools[item.id] = tool({
+      id: item.id as any,
+      description: item.description,
+      inputSchema: jsonSchema(schema as any),
+
+      // ★ 关键：execute 函数
+      async execute(args, options) {
+        const ctx = context(args, options)
+
+        // 执行前触发插件
+        await Plugin.trigger("tool.execute.before", { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID }, { args })
+
+        // ★ 调用工具的实际执行函数
+        const result = await item.execute(args, ctx)
+
+        // 处理附件
+        const output = {
+          ...result,
+          attachments: result.attachments?.map((attachment) => ({
+            ...attachment,
+            id: Identifier.ascending("part"),
+            sessionID: ctx.sessionID,
+            messageID: input.processor.message.id,
+          })),
+        }
+
+        // 执行后触发插件
+        await Plugin.trigger("tool.execute.after", { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args }, output)
+
+        return output
+      },
+    })
+  }
+
+  // 处理 MCP 工具（类似逻辑）
+  for (const [key, item] of Object.entries(await MCP.tools())) {
+    // ... 类似的包装逻辑
+  }
+
+  return tools
+}
+```
+
+**resolveTools 的作用**：
+1. 从 ToolRegistry 获取所有注册的工具
+2. 将每个工具包装成 AI SDK 的 `Tool` 格式
+3. 注入执行上下文（sessionID、abort、权限等）
+4. 添加插件钩子（before/after）
+
+#### 11.6.4 第三步：传递给 LLM.stream
+
+**位置**：`src/session/prompt.ts:666-717`
+
+```typescript
+// 在 loop() 中调用
+const streamInput: LLM.StreamInput = {
+  user: lastUser,
+  sessionID,
+  model,
+  agent,
+  system,
+  abort,
+  messages: MessageV2.toModelMessages(msgs, model),
+  tools: await resolveTools({
+    agent,
+    model,
+    session,
+    processor,
+    bypassAgentCheck: false,
+    messages: msgs,
+  }),
+}
+
+const result = await processor.process(streamInput)
+```
+
+**LLM.stream 内部**（`src/session/llm.ts:46-260`）：
+
+```typescript
+export async function stream(input: StreamInput) {
+  // ...
+
+  const tools = await resolveTools(input)  // 这里实际上已经在 prompt.ts 中调用过了
+
+  return streamText({
+    // ...
+    activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+    tools,                                    // ← 传递给 AI SDK
+    toolChoice: input.toolChoice,
+    // ...
+  })
+}
+```
+
+**注意**：`resolveTools` 在 `prompt.ts` 中被调用，生成的 tools 对象通过 `StreamInput` 传递给 `LLM.stream`，然后传给 `streamText`。
+
+#### 11.6.5 第四步：AI SDK streamText 处理
+
+`streamText` 是 Vercel AI SDK 的核心函数，它：
+1. 将 tools 定义转换为各提供商的格式
+2. 发送请求给模型 API
+3. 解析流式响应
+4. 当模型返回工具调用时，**自动调用工具的 execute 函数**
+5. 产生 `tool-call`、`tool-result` 等事件
+
+**AI SDK 内部流程**（伪代码）：
+
+```typescript
+// AI SDK 内部逻辑（简化）
+async function* streamText({ tools, messages, ... }) {
+  // 1. 发送请求给模型
+  const response = await model.doStream({ messages, tools: transformTools(tools), ... })
+
+  // 2. 解析流式响应
+  for await (const chunk of response.stream) {
+    if (chunk.type === "tool_use") {
+      // 模型请求调用工具
+      const toolCall = chunk.toolCall
+
+      // 3. 产生 tool-call 事件（给 consumer 处理）
+      yield { type: "tool-call", toolCallId: toolCall.id, toolName: toolCall.name, input: toolCall.input }
+
+      // 4. 自动执行工具
+      const tool = tools[toolCall.name]
+      if (tool && tool.execute) {
+        const result = await tool.execute(toolCall.input, { toolCallId: toolCall.id, ... })
+
+        // 5. 产生 tool-result 事件
+        yield { type: "tool-result", toolCallId: toolCall.id, output: result }
+      }
+    }
+  }
+}
+```
+
+#### 11.6.6 第五步：processor.process 处理工具事件
+
+**位置**：`src/session/processor.ts:55-347`
+
+```typescript
+async process(streamInput: LLM.StreamInput) {
+  const stream = await LLM.stream(streamInput)
+
+  for await (const value of stream.fullStream) {
+    input.abort.throwIfAborted()
+
+    switch (value.type) {
+      // ... 其他事件处理
+
+      case "tool-call": {
+        const match = toolcalls[value.toolCallId]
+        if (match) {
+          // 更新 part 状态为 "running"
+          const part = await Session.updatePart({
+            ...match,
+            tool: value.toolName,
+            state: {
+              status: "running",
+              input: value.input,
+              time: { start: Date.now() },
+            },
+            metadata: value.providerMetadata,
+          })
+          toolcalls[value.toolCallId] = part as MessageV2.ToolPart
+
+          // 检测死循环（连续 3 次相同工具调用）
+          const parts = await MessageV2.parts(input.assistantMessage.id)
+          const lastThree = parts.slice(-3)
+          if (lastThree.length === 3 && lastThree.every(
+            (p) => p.type === "tool" && p.tool === value.toolName && JSON.stringify(p.state.input) === JSON.stringify(value.input)
+          )) {
+            await PermissionNext.ask({ permission: "doom_loop", ... })
+          }
+        }
+        break
+      }
+
+      case "tool-result": {
+        const match = toolcalls[value.toolCallId]
+        if (match && match.state.status === "running") {
+          // 更新 part 状态为 "completed"
+          await Session.updatePart({
+            ...match,
+            state: {
+              status: "completed",
+              input: value.input ?? match.state.input,
+              output: value.output.output,       // ← 工具输出
+              metadata: value.output.metadata,
+              title: value.output.title,
+              time: { start: match.state.time.start, end: Date.now() },
+              attachments: value.output.attachments,
+            },
+          })
+          delete toolcalls[value.toolCallId]
+        }
+        break
+      }
+
+      case "tool-error": {
+        const match = toolcalls[value.toolCallId]
+        if (match && match.state.status === "running") {
+          await Session.updatePart({
+            ...match,
+            state: {
+              status: "error",
+              input: value.input ?? match.state.input,
+              error: (value.error as any).toString(),
+              time: { start: match.state.time.start, end: Date.now() },
+            },
+          })
+          // 如果是权限拒绝或问题拒绝，设置 blocked 标记
+          if (value.error instanceof PermissionNext.RejectedError || value.error instanceof Question.RejectedError) {
+            blocked = shouldBreak
+          }
+          delete toolcalls[value.toolCallId]
+        }
+        break
+      }
+    }
+  }
+
+  // 返回处理结果
+  if (needsCompaction) return "compact"
+  if (blocked) return "stop"
+  if (input.assistantMessage.error) return "stop"
+  return "continue"
+}
+```
+
+#### 11.6.7 第六步：结果发送给模型
+
+当 `processor.process()` 返回 `"continue"` 时，`loop()` 继续循环：
+
+**位置**：`src/session/prompt.ts:718-726`
+
+```typescript
+// processor.process() 返回 "continue"
+if (result === "continue") {
+  continue  // 继续循环
+}
+
+// 下一轮循环
+const msgs = await MessageV2.filterCompacted(MessageV2.stream({ sessionID }))
+```
+
+**消息转换**（`src/session/message-v2.ts:606-670`）：
+
+```typescript
+// 转换助手消息中的工具调用
+for (const part of msg.parts) {
+  if (part.type === "tool") {
+    if (part.state.status === "completed") {
+      // 已完成的工具调用 → 输出结果
+      assistantMessage.parts.push({
+        type: ("tool-" + part.tool),
+        state: "output-available",
+        input: part.state.input,
+        output: part.state.output,      // ← WebSearch 的搜索结果
+      })
+    }
+  }
+}
+
+// 转换为模型消息格式
+function toModelMessage(assistantMessage) {
+  return {
+    role: "assistant",
+    content: [
+      ...assistantMessage.parts.map((part) => {
+        if (part.type.startsWith("tool-")) {
+          return {
+            type: "tool-call",
+            toolCallId: part.callID,
+            toolName: part.tool,
+            input: part.input,
+          }
+        }
+        // ...
+      }),
+    ],
+  }
+}
+
+// 工具结果作为 tool 消息
+function toToolResultMessage(part) {
+  return {
+    role: "tool",
+    content: [{
+      type: "tool-result",
+      toolCallId: part.callID,
+      toolName: part.tool,
+      result: part.state.output,        // ← 搜索结果文本
+    }],
+  }
+}
+```
+
+#### 11.6.8 完整代码调用时序图
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                              工具调用时序图                                        │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  loop() [prompt.ts]                                                              │
+│    │                                                                             │
+│    ├── resolveTools() [prompt.ts:750-842]                                        │
+│    │     ├── ToolRegistry.tools() [registry.ts]                                  │
+│    │     │     └── 返回 WebSearchTool, ReadTool, ...                              │
+│    │     │                                                                        │
+│    │     └── 构建 tools 对象：                                                    │
+│    │           tools["websearch"] = tool({                                        │
+│    │             description: "...",                                              │
+│    │             inputSchema: jsonSchema(...),                                    │
+│    │             execute: async (args, options) => {                              │
+│    │               ctx = context(args, options)                                   │
+│    │               await Plugin.trigger("tool.execute.before", ...)               │
+│    │               result = await WebSearchTool.execute(args, ctx)                │
+│    │               await Plugin.trigger("tool.execute.after", ...)                │
+│    │               return result                                                  │
+│    │             }                                                                │
+│    │           })                                                                 │
+│    │                                                                             │
+│    ├── processor.process(streamInput) [processor.ts:45-417]                      │
+│    │     │                                                                        │
+│    │     └── LLM.stream(streamInput) [llm.ts:46-260]                             │
+│    │           │                                                                  │
+│    │           └── streamText({ tools, messages, ... }) [AI SDK]                 │
+│    │                 │                                                            │
+│    │                 ├── [模型返回 tool-call]                                     │
+│    │                 │                                                            │
+│    │                 ├── AI SDK 自动调用 tools["websearch"].execute(args)        │
+│    │                 │     │                                                      │
+│    │                 │     └── WebSearchTool.execute(args, ctx) [websearch.ts]   │
+│    │                 │           ├── ctx.ask() 权限检查                           │
+│    │                 │           ├── fetch("https://mcp.exa.ai/mcp")             │
+│    │                 │           └── return { output: "搜索结果", ... }           │
+│    │                 │                                                            │
+│    │                 └── [AI SDK 发出 tool-result 事件]                          │
+│    │                                                                              │
+│    ├── processor.process() 处理事件 [processor.ts]                               │
+│    │     │                                                                        │
+│    │     ├── case "tool-call":                                                    │
+│    │     │     └── Session.updatePart({ state: { status: "running" } })          │
+│    │     │                                                                        │
+│    │     └── case "tool-result":                                                  │
+│    │           └── Session.updatePart({                                          │
+│    │               state: {                                                       │
+│    │                 status: "completed",                                         │
+│    │                 output: "搜索结果文本...",                                   │
+│    │               }                                                               │
+│    │             })                                                                │
+│    │                                                                              │
+│    └── return "continue" → loop() 继续循环                                       │
+│                                                                                  │
+│  下一轮 loop() 循环                                                               │
+│    │                                                                             │
+│    ├── msgs = MessageV2.stream() → 读取包含工具结果的最新消息                     │
+│    │                                                                             │
+│    ├── MessageV2.toModelMessages() → 转换为模型格式                               │
+│    │     └── 包含 tool-result 消息：{ role: "tool", content: [...] }             │
+│    │                                                                             │
+│    └── LLM.stream({ messages: [..., tool-result] }) → 发送给模型                 │
+│          └── 模型看到搜索结果，生成最终回复                                       │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 11.6.9 关键代码位置总结
+
+| 阶段 | 文件 | 行号 | 作用 |
+|------|------|------|------|
+| 工具定义 | `src/tool/tool.ts` | 48-88 | `Tool.define()` 包装函数 |
+| 工具实现 | `src/tool/websearch.ts` | 40-150 | WebSearch 具体实现 |
+| 工具注册 | `src/tool/registry.ts` | - | `ToolRegistry.tools()` 返回所有工具 |
+| 工具解析 | `src/session/prompt.ts` | 750-842 | `resolveTools()` 构建 AI SDK 工具对象 |
+| 传递工具 | `src/session/llm.ts` | 176-260 | `streamText({ tools })` |
+| 事件处理 | `src/session/processor.ts` | 134-202 | `tool-call`/`tool-result` 事件处理 |
+| 消息转换 | `src/session/message-v2.ts` | 606-670 | `toModelMessages()` 包含工具结果 |
+| 循环控制 | `src/session/prompt.ts` | 718-726 | `continue` 继续循环 |
+
 ---
 
 ## 12. 循环控制逻辑
@@ -3817,6 +4612,466 @@ export const GlobalBus = new EventEmitter<{
 | `session.updated` | Session 更新 | UI 更新会话信息 |
 | `session.status` | 状态变化 | 显示 busy/idle/retry 状态 |
 | `permission.asked` | 请求权限 | 显示确认对话框 |
+
+### 16.6 CLI Run 模式：一次性命令与流式数据
+
+#### 16.6.1 CLI Run 模式概述
+
+CLI Run 模式（`opencode run "message"`）是一种**非交互式**执行模式，用于：
+- 在脚本中自动化执行任务
+- CI/CD 集成
+- 批量处理
+
+**核心问题**：大模型是流式返回数据的，而 CLI Run 需要执行一次性命令后退出。如何结合？
+
+**解决方案**：分离"命令发送"和"事件消费"，通过 SSE（Server-Sent Events）实现流式输出。
+
+#### 16.6.2 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        CLI Run 模式架构                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  CLI 客户端 (run.ts)                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 订阅事件流                                                        │   │
+│  │     sdk.event.subscribe() → GET /global/event (SSE)                  │   │
+│  │                                                                       │   │
+│  │  2. 发送命令                                                          │   │
+│  │     sdk.session.prompt() → POST /session/:id/message                 │   │
+│  │     或 sdk.session.command() → POST /session/:id/command             │   │
+│  │                                                                       │   │
+│  │  3. 监听事件流，实时渲染                                               │   │
+│  │     for await (const event of events.stream) { ... }                 │   │
+│  │                                                                       │   │
+│  │  4. 收到 status === "idle" 时退出                                     │   │
+│  │     if (event.type === "session.status" && status.type === "idle")   │   │
+│  │       break                                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              ↑ HTTP/SSE                                     │
+│                              ↓                                              │
+│  Server 端                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  GlobalBus (EventEmitter)                                            │   │
+│  │     ↑ publish()                                                       │   │
+│  │     │                                                                  │   │
+│  │  SessionPrompt.loop()                                                 │   │
+│  │     ├── processor.process() → 处理流式响应                             │   │
+│  │     │     └── Session.updatePart() → Bus.publish()                   │   │
+│  │     │              ↓                                                  │   │
+│  │     │         GlobalBus.emit("event", ...)                            │   │
+│  │     │              ↓                                                  │   │
+│  │     │         SSE endpoint → 推送给客户端                              │   │
+│  │     │                                                                  │   │
+│  │     └── SessionStatus.set({ type: "idle" }) → 发送 idle 事件         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 16.6.3 代码流程详解
+
+**位置**：`src/cli/cmd/run.ts`
+
+**Step 1：订阅事件流**
+
+```typescript
+// run.ts:437
+const events = await sdk.event.subscribe()  // 调用 GET /global/event
+
+// SDK 内部使用 SSE 连接
+// 返回一个 AsyncIterable，可以 for await 遍历
+```
+
+**Step 2：启动事件监听循环**
+
+```typescript
+// run.ts:440-545
+async function loop() {
+  const toggles = new Map<string, boolean>()
+
+  for await (const event of events.stream) {
+    // 处理各种事件类型...
+
+    // ★ 关键：收到 idle 状态时退出
+    if (
+      event.type === "session.status" &&
+      event.properties.sessionID === sessionID &&
+      event.properties.status.type === "idle"
+    ) {
+      break  // ← 退出循环，CLI Run 完成
+    }
+  }
+}
+```
+
+**Step 3：发送命令（并行执行）**
+
+```typescript
+// run.ts:578-601
+loop().catch((e) => {
+  console.error(e)
+  process.exit(1)
+})
+
+// 立即发送命令，不等待 loop() 完成
+if (args.command) {
+  await sdk.session.command({
+    sessionID,
+    agent,
+    model: args.model,
+    command: args.command,
+    arguments: message,
+  })
+} else {
+  await sdk.session.prompt({
+    sessionID,
+    agent,
+    model,
+    parts: [...files, { type: "text", text: message }],
+  })
+}
+```
+
+**关键设计**：`loop()` 和 `sdk.session.prompt()` 是**并行执行**的：
+- `loop()` 开始监听事件流
+- `sdk.session.prompt()` 触发服务器端处理
+- 事件通过 SSE 实时推送给 `loop()`
+- 处理完成后，服务器发送 `idle` 状态，`loop()` 退出
+
+#### 16.6.4 事件处理逻辑（客户端）
+
+**位置**：`src/cli/cmd/run.ts:440-545`
+
+**关键理解**：
+- **事件是流式接收的**（通过 SSE）
+- **输出是混合模式**：部分立即输出，部分完成后输出
+
+**输出时机分类**：
+
+| 事件/条件 | 输出时机 | 说明 |
+|---------|---------|------|
+| `message.updated` | **立即输出** | 打印 `> agent · model` 头部 |
+| `tool` + `completed` | 完成时输出 | 工具执行完才打印结果 |
+| `task` + `running` | **立即输出** | 子任务开始就显示进度 |
+| `text` + `time.end` | 完成时输出 | 文本生成完才打印 |
+| `reasoning` + `time.end` | 完成时输出 | 推理完成才打印 |
+
+**与 TUI 模式的区别**：
+
+| 模式 | 文本显示方式 | 处理的事件 |
+|------|-------------|-----------|
+| **TUI** | 逐字符流式显示 | `message.part.delta`（每次几个字符） |
+| **CLI Run** | 块式输出（文本完成后） | `message.part.updated`（仅 `time.end` 时） |
+
+**代码逻辑**：
+
+```typescript
+// run.ts:443-530
+for await (const event of events.stream) {  // ← 流式接收事件（SSE）
+
+  // 1. 助手消息开始 → ★ 立即输出头部
+  if (event.type === "message.updated" && event.properties.info.role === "assistant") {
+    UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
+  }
+
+  // 2. Part 更新事件
+  if (event.type === "message.part.updated") {
+    const part = event.properties.part
+
+    // 2a. 工具完成 → 完成时输出
+    if (part.type === "tool" && part.state.status === "completed") {
+      tool(part)  // 渲染工具输出（bash、read、write 等）
+    }
+
+    // 2b. Task 工具运行中 → ★ 立即输出（例外）
+    if (part.type === "tool" && part.tool === "task" && part.state.status === "running") {
+      task(props<typeof TaskTool>(part))  // 显示子任务开始
+    }
+
+    // 2c. 文本完成 → 完成时输出（time.end 存在）
+    if (part.type === "text" && part.time?.end) {
+      const text = part.text.trim()
+      if (!text) continue
+      if (!process.stdout.isTTY) {
+        process.stdout.write(text + EOL)
+      } else {
+        UI.empty()
+        UI.println(text)
+        UI.empty()
+      }
+    }
+
+    // 2d. 推理完成 → 完成时输出
+    if (part.type === "reasoning" && part.time?.end && args.thinking) {
+      UI.println(`Thinking: ${part.text.trim()}`)
+    }
+  }
+
+  // 3. 错误处理 → 立即输出
+  if (event.type === "session.error") {
+    UI.error(String(props.error.name))
+  }
+
+  // 4. 权限请求 → 立即输出并自动拒绝
+  if (event.type === "permission.asked") {
+    UI.println(`permission requested: ${permission.permission}; auto-rejecting`)
+    await sdk.permission.reply({ requestID: permission.id, reply: "reject" })
+  }
+}
+```
+
+**输出时间线示例**：
+
+```
+时间 0s:   message.updated          → ★ 立即打印 "> claude · claude-3-opus"
+时间 0.1s: tool part (running)      → 不输出
+时间 1s:   tool part (completed)    → ★ 输出工具结果（如：$ npm test）
+时间 1.1s: task part (running)      → ★ 立即显示 "• Task名称"
+时间 2s:   text part (time.end)     → ★ 输出完整文本
+时间 2.1s: status = idle            → 退出循环
+```
+
+**为什么文本/工具结果是块式输出？**
+
+1. **稳定性**：CLI Run 常用于脚本/CI，不需要打字机动画效果
+2. **可预测性**：输出不会因为网络波动而中断
+3. **管道友好**：输出可以安全地管道到其他命令
+
+**为什么头部和 Task 是立即输出？**
+
+1. **头部信息**：让用户知道模型已开始响应
+2. **Task 进度**：显示子任务正在执行，提供进度反馈
+
+#### 16.6.5 服务器端如何发送事件
+
+**事件发布链路**：
+
+```
+processor.process()
+    ↓
+Session.updatePart(part)
+    ↓
+MessageV2.Event.PartUpdated.publish()
+    ↓
+Bus.publish(MessageV2.Event.PartUpdated, properties)
+    ↓
+GlobalBus.emit("event", { directory, payload })
+    ↓
+SSE endpoint (/global/event)
+    ↓
+stream.writeSSE({ data: JSON.stringify(event) })
+    ↓
+CLI 客户端收到事件
+```
+
+**SSE 端点**（`src/server/routes/global.ts:41-109`）：
+
+```typescript
+.get("/event", async (c) => {
+  return streamSSE(c, async (stream) => {
+    // 1. 发送连接事件
+    stream.writeSSE({
+      data: JSON.stringify({
+        payload: { type: "server.connected", properties: {} },
+      }),
+    })
+
+    // 2. 注册事件处理器
+    async function handler(event: any) {
+      await stream.writeSSE({
+        data: JSON.stringify(event),  // ← 将事件推送给客户端
+      })
+    }
+    GlobalBus.on("event", handler)
+
+    // 3. 心跳保活
+    const heartbeat = setInterval(() => {
+      stream.writeSSE({
+        data: JSON.stringify({
+          payload: { type: "server.heartbeat", properties: {} },
+        }),
+      })
+    }, 10_000)
+
+    // 4. 等待断开
+    await new Promise<void>((resolve) => {
+      stream.onAbort(() => {
+        clearInterval(heartbeat)
+        GlobalBus.off("event", handler)
+        resolve()
+      })
+    })
+  })
+})
+```
+
+#### 16.6.6 如何判断处理完成
+
+**关键机制**：`SessionStatus`
+
+```typescript
+// src/session/status.ts
+export namespace SessionStatus {
+  export type Info =
+    | { type: "idle" }    // 空闲，处理完成
+    | { type: "busy" }    // 忙碌，正在处理
+    | { type: "retry", attempt: number, message: string, next: number }  // 重试中
+
+  export function set(sessionID: string, status: Info) {
+    // 发布状态变更事件
+    Bus.publish(Event.Status, { sessionID, status })
+
+    if (status.type === "idle") {
+      delete state()[sessionID]  // 清理状态
+      return
+    }
+    state()[sessionID] = status
+  }
+}
+```
+
+**状态变化时机**（`src/session/processor.ts`）：
+
+```typescript
+async process(streamInput: LLM.StreamInput) {
+  try {
+    const stream = await LLM.stream(streamInput)
+
+    for await (const value of stream.fullStream) {
+      switch (value.type) {
+        case "start":
+          SessionStatus.set(input.sessionID, { type: "busy" })  // ← 开始处理
+          break
+        // ... 处理各种事件
+      }
+    }
+  } catch (e) {
+    // 错误处理
+  } finally {
+    SessionStatus.set(input.sessionID, { type: "idle" })  // ← 处理完成
+  }
+}
+```
+
+**CLI Run 检测完成**：
+
+```typescript
+// run.ts:524-529
+if (
+  event.type === "session.status" &&
+  event.properties.sessionID === sessionID &&
+  event.properties.status.type === "idle"
+) {
+  break  // ← 收到 idle 状态，退出循环
+}
+```
+
+#### 16.6.7 流式数据与一次性命令的结合
+
+**核心思想**：
+
+| 概念 | 说明 |
+|------|------|
+| **命令是一次性的** | HTTP POST 请求，发送后立即返回 |
+| **数据是流式的** | 通过 SSE 实时推送，边处理边输出 |
+| **退出是事件驱动的** | 收到 `idle` 状态时退出 |
+
+**时序图**：
+
+```
+CLI Client                              Server
+    │                                     │
+    │──── GET /global/event (SSE) ────────→│
+    │←───── Connected ────────────────────│
+    │                                     │
+    │──── POST /session/:id/prompt ───────→│
+    │       (立即返回)                      │
+    │                                     │
+    │               ┌─── loop() 开始处理 ──┤
+    │               │                      │
+    │←──── message.part.updated ───────────│ (工具开始)
+    │←──── message.part.updated ───────────│ (工具完成)
+    │←──── message.part.updated ───────────│ (文本完成)
+    │               │                      │
+    │               └─── loop() 结束 ──────┤
+    │←──── session.status (idle) ─────────│
+    │                                     │
+    │──── 关闭 SSE 连接 ──────────────────→│
+    │                                     │
+    ↓                                     ↓
+  退出                                   等待下一个请求
+```
+
+#### 16.6.8 输出格式
+
+CLI Run 支持两种输出格式：
+
+**1. 默认格式（格式化输出）**
+
+```bash
+$ opencode run "读取 package.json 并告诉我版本号"
+
+> claude · claude-3-opus
+
+→ Read package.json
+← Edit package.json
+  - "version": "1.0.0"
+  + "version": "1.0.1"
+
+根据 package.json，当前版本号是 1.0.0。
+```
+
+**2. JSON 格式（原始事件）**
+
+```bash
+$ opencode run "hello" --format json
+
+{"type":"step_start","timestamp":1234567890,"sessionID":"xxx","part":{...}}
+{"type":"tool_use","timestamp":1234567891,"sessionID":"xxx","part":{...}}
+{"type":"text","timestamp":1234567892,"sessionID":"xxx","part":{...}}
+{"type":"step_finish","timestamp":1234567893,"sessionID":"xxx","part":{...}}
+```
+
+**实现**：
+
+```typescript
+// run.ts:429-435
+function emit(type: string, data: Record<string, unknown>) {
+  if (args.format === "json") {
+    process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID, ...data }) + EOL)
+    return true  // 跳过默认格式化
+  }
+  return false
+}
+
+// 使用
+if (part.type === "tool" && part.state.status === "completed") {
+  if (emit("tool_use", { part })) continue  // JSON 模式：已输出，跳过
+  tool(part)                                  // 默认模式：格式化输出
+}
+```
+
+#### 16.6.9 与 TUI 模式的对比
+
+| 特性 | CLI Run 模式 | TUI 模式 |
+|------|-------------|----------|
+| 交互性 | 非交互 | 全交互 |
+| 输出方式 | 流式（SSE） | 流式（SSE + WebSocket） |
+| 退出条件 | `status === "idle"` | 用户主动退出 |
+| 权限处理 | 自动拒绝 | 用户确认 |
+| 适用场景 | 脚本、CI/CD | 日常开发 |
+
+**共享机制**：
+
+两者使用**完全相同**的事件发布/订阅机制：
+- 服务器端：同样的 `Bus.publish()` 和 `GlobalBus.emit()`
+- 客户端：同样的 `sdk.event.subscribe()` 和 SSE 连接
+
+区别只在于：
+- CLI Run：单次执行，收到 idle 就退出
+- TUI：持续监听，用户可以继续输入
 
 ---
 
