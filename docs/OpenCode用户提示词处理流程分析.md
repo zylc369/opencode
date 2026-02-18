@@ -1620,13 +1620,83 @@ export async function prune(input: { sessionID: string }) {
     }
   }
 
-  // 标记为已压缩（输出会被替换为 "[Old tool result content cleared]"）
+  // 标记为已压缩
   for (const part of toPrune) {
     part.state.time.compacted = Date.now()
     await Session.updatePart(part)
   }
 }
 ```
+
+**清理的是什么？**
+
+| 维度 | 答案 |
+|------|------|
+| 操作级别 | **Part 级别**（tool 类型的 part） |
+| 设置什么 | `part.state.time.compacted` 字段（时间戳） |
+| 原始数据 | **保留在数据库中**，不删除 |
+| 实际效果 | 转换为模型消息时，用占位符替换输出内容 |
+
+**`Session.updatePart` 如何更新数据？**
+
+**位置**：`src/session/index.ts:646-667`
+
+```typescript
+export const updatePart = fn(UpdatePartInput, async (part) => {
+  const { id, messageID, sessionID, ...data } = part  // ← 解构，data 包含所有其他字段
+  Database.use((db) => {
+    db.insert(PartTable)
+      .values({
+        id,
+        message_id: messageID,
+        session_id: sessionID,
+        data,  // ← 整个 data 对象被序列化存储
+      })
+      .onConflictDoUpdate({ target: PartTable.id, set: { data } })
+      .run()
+  })
+})
+```
+
+**`...data` 解构的作用**：
+
+```typescript
+const { id, messageID, sessionID, ...data } = part
+```
+
+- `id`, `messageID`, `sessionID` → 存到数据库的**独立列**
+- **剩余所有字段**（`type`, `state`, `state.time.compacted` 等）→ 打包到 `data` 对象
+- `data` 被序列化为 JSON 存储到数据库的 `data` 列
+
+**数据库存储结构**：
+
+```
+PartTable:
+├── id (列)
+├── message_id (列)
+├── session_id (列)
+├── time_created (列)
+└── data (列) ← JSON 字段，包含 { type, state: { time: { compacted: ... } } }
+```
+
+所以 `updatePart` 不需要逐个读取字段，而是把整个 part 对象（除了 ID 字段）序列化后直接存储。
+
+**实际清理发生在哪里？**
+
+**位置**：`src/session/message-v2.ts:620-621`
+
+```typescript
+// 转换为模型消息时
+const outputText = part.state.time.compacted
+  ? "[Old tool result content cleared]"  // 已清理：用占位符替换
+  : part.state.output                     // 未清理：原样输出
+
+const attachments = part.state.time.compacted
+  ? []                                    // 已清理：清空附件
+  : (part.state.attachments ?? [])        // 未清理：原样保留
+```
+
+这是一种**"软删除"机制**：原始数据保留在数据库中，但在发送给模型时被替换为占位符，减少上下文 token 消耗。
 
 **与 compaction 的区别**：
 - **compaction**：生成对话摘要，通过 `summary` 标记截断历史
