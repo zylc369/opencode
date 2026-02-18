@@ -157,9 +157,11 @@ export namespace SessionPrompt {
 
   export const prompt = fn(PromptInput, async (input) => {
     const session = await Session.get(input.sessionID)
+    log.info(`[prompt] sessionID=${input.sessionID}, session=${session}, input=${JSON.stringify(input)}`)
     await SessionRevert.cleanup(session)
 
     const message = await createUserMessage(input)
+    log.info(`[prompt] sessionID=${input.sessionID}, message=${JSON.stringify(message)}`)
     await Session.touch(input.sessionID)
 
     // this is backwards compatibility for allowing `tools` to be specified when
@@ -178,6 +180,7 @@ export namespace SessionPrompt {
     }
 
     if (input.noReply === true) {
+      log.warn(`[prompt] noReply`)
       return message
     }
 
@@ -276,11 +279,14 @@ export namespace SessionPrompt {
 
     const abort = resume_existing ? resume(sessionID) : start(sessionID)
     if (!abort) {
+      log.info(`[loop][No abort object] sessionID=${sessionID}, resume_existing=${resume_existing}`)
       return new Promise<MessageV2.WithParts>((resolve, reject) => {
         const callbacks = state()[sessionID].callbacks
         callbacks.push({ resolve, reject })
       })
     }
+
+    log.info(`[loop][${typeof abort}] sessionID=${sessionID}, resume_existing=${resume_existing}`)
 
     using _ = defer(() => cancel(sessionID))
 
@@ -294,8 +300,13 @@ export namespace SessionPrompt {
     while (true) {
       SessionStatus.set(sessionID, { type: "busy" })
       log.info("loop", { step, sessionID })
-      if (abort.aborted) break
+      if (abort.aborted) {
+        log.warn("loop aborted")
+        break
+      }
       let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+
+      log.warn("loop aborted")
 
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined

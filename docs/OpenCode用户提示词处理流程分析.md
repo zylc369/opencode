@@ -355,7 +355,7 @@ export const loop = fn(LoopInput, async (input) => {
     let lastAssistant: MessageV2.Assistant | undefined
     // ... 倒序遍历查找
 
-    // 5. 检查是否应该退出循环
+    // 5. 检查是否应该退出循环，详细解释见第12节
     if (lastAssistant?.finish && !["tool-calls", "unknown"].includes(lastAssistant.finish)) {
       break  // 模型已完成，退出循环
     }
@@ -412,7 +412,7 @@ export async function filterCompacted(stream: AsyncIterable<MessageV2.WithParts>
   for await (const msg of stream) {
     result.push(msg)
 
-    // 如果是用户消息，且已完成压缩，且包含 compaction part，则停止
+    // 如果是用户消息，且已完成压缩，且包含 compaction part，则停止，因为后续的消息都是压缩后的结果，不需要再处理了
     if (
       msg.info.role === "user" &&
       completed.has(msg.info.id) &&
@@ -420,12 +420,13 @@ export async function filterCompacted(stream: AsyncIterable<MessageV2.WithParts>
     )
       break
 
-    // 如果是助手消息且已总结完成，标记其父消息为已完成
+    // 如果是助手消息且已总结完成，标记其父消息为已完成，父消息即用户消息
     if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish)
       completed.add(msg.info.parentID)
   }
 
-  result.reverse()  // 反转顺序
+  // 反转顺序，数据库是倒序查询的，但模型需要按时间正序处理（最早的在前）
+  result.reverse()
   return result
 }
 ```
@@ -1021,10 +1022,39 @@ if (
 }
 ```
 
-**退出条件**:
-- 助手消息有 `finish` 标记
-- `finish` 不是 `"tool-calls"` 或 `"unknown"`
-- 用户消息在助手消息之前
+这段代码判断**模型已经完成对用户消息的响应，不需要继续处理工具调用**。三个条件必须同时满足：
+
+#### 条件 1：`lastAssistant?.finish`
+
+最后一条助手消息有 `finish` 原因。`finish` 字段表示模型完成响应的原因，可能的值包括：
+
+| finish 值 | 含义 |
+|-----------|------|
+| `"stop"` | 正常结束（没有工具调用） |
+| `"tool-calls"` | 模型调用了工具，需要继续处理 |
+| `"length"` | 达到最大 token 限制 |
+| `"content-filter"` | 内容被过滤 |
+| `"unknown"` | 未知原因 |
+
+#### 条件 2：`!["tool-calls", "unknown"].includes(lastAssistant.finish)`
+
+`finish` **不是** `"tool-calls"` 或 `"unknown"`。
+
+- 排除 `"tool-calls"`：如果模型调用了工具，循环需要继续处理工具调用结果
+- 排除 `"unknown"`：无法确定完成原因时，不退出循环
+
+#### 条件 3：`lastUser.id < lastAssistant.id`
+
+用户消息的 id 小于助手消息的 id。由于 id 是按时间递增生成的，这意味着**助手消息是对这条用户消息的响应**（而不是旧的历史记录）。
+
+#### 退出条件总结
+
+当三个条件都满足时，说明：
+- 模型已完成响应（有 finish 原因）
+- 没有待处理的工具调用（finish 不是 tool-calls）
+- 这是对用户输入的完整回复（用户消息在助手消息之前）
+
+所以可以安全退出循环。
 
 ### 12.2 循环继续条件
 
@@ -1232,11 +1262,263 @@ export const updatePartDelta = fn({...}, async (input) => {
 })
 ```
 
-### 16.4 前端订阅
+### 16.4 Bus.publish 的完整调用链路
 
-前端通过 WebSocket/SSE 订阅 Bus 事件：
-- `MessageV2.Event.PartUpdated`: part 完整更新
-- `MessageV2.Event.PartDelta`: 文本增量更新
+#### 16.4.1 核心问题：`Bus.publish(MessageV2.Event.Updated, { info: msg })` 的作用是什么？
+
+这行代码的作用是**将消息更新事件广播给所有订阅者**，实现服务端到客户端的实时通信。
+
+#### 16.4.2 完整调用链路图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        服务端 (Node.js/Bun)                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. Session.updateMessage(msg)                                          │
+│     │                                                                   │
+│     └── Database.use((db) => {                                          │
+│           db.insert(...).run()         // 执行数据库操作                  │
+│           Database.effect(() =>        // 注册副作用函数                  │
+│             Bus.publish(MessageV2.Event.Updated, { info: msg })         │
+│           )                                                             │
+│         })                                                              │
+│         │                                                               │
+│         └── 数据库操作完成后，执行所有 effects                            │
+│                                                                         │
+│  2. Bus.publish()                                        [src/bus/index.ts:41]
+│     │                                                                   │
+│     ├── 构建 payload: { type: "message.updated", properties: { info } } │
+│     │                                                                   │
+│     ├── 调用本地订阅者                                                   │
+│     │   └── for (key of [def.type, "*"])                               │
+│     │       └── for (sub of subscriptions.get(key))                    │
+│     │           └── sub(payload)        // 调用订阅回调                  │
+│     │                                                                   │
+│     └── GlobalBus.emit("event", { directory, payload })  [全局事件总线]  │
+│                                                                         │
+│  3. 服务器 SSE 端点                                      [src/server/server.ts:539]
+│     │                                                                   │
+│     └── Bus.subscribeAll(async (event) => {                            │
+│           await stream.writeSSE({                                      │
+│             data: JSON.stringify(event)  // 通过 SSE 发送给客户端        │
+│           })                                                            │
+│         })                                                              │
+│                                                                         │
+└───────────────────────────┬─────────────────────────────────────────────┘
+                            │ HTTP SSE (Server-Sent Events)
+                            ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           客户端 (TUI/Desktop/Web)                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  4. SSE 连接接收事件                                     [src/cli/cmd/tui/context/sync.tsx]
+│     │                                                                   │
+│     └── for await (const event of events.stream) {                     │
+│           switch (event.type) {                                         │
+│             case "message.updated":                                     │
+│               // 更新本地状态存储                                         │
+│               setStore("message", sessionID, [...])                    │
+│               // 触发 UI 重新渲染                                         │
+│           }                                                             │
+│         }                                                               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 16.4.3 Database.effect 的作用
+
+**位置**: `src/storage/db.ts:105-125`
+
+```typescript
+export function use<T>(callback: (trx: TxOrDb) => T): T {
+  try {
+    return callback(ctx.use().tx)
+  } catch (err) {
+    if (err instanceof Context.NotFound) {
+      const effects: (() => void | Promise<void>)[] = []
+      const result = ctx.provide({ effects, tx: Client() }, () => callback(Client()))
+      for (const effect of effects) effect()  // 数据库操作完成后执行所有 effects
+      return result
+    }
+    throw err
+  }
+}
+
+export function effect(fn: () => any | Promise<any>) {
+  try {
+    ctx.use().effects.push(fn)  // 将副作用函数添加到队列
+  } catch {
+    fn()  // 如果不在 Database.use 上下文中，直接执行
+  }
+}
+```
+
+**设计原因**：
+- 确保事件只在数据库操作**成功完成后**才发布
+- 如果数据库操作失败，事件不会被发布
+- 避免在事务中间发布事件导致状态不一致
+
+#### 16.4.4 Bus.publish 的实现
+
+**位置**: `src/bus/index.ts:41-64`
+
+```typescript
+export async function publish<Definition extends BusEvent.Definition>(
+  def: Definition,
+  properties: z.output<Definition["properties"]>,
+) {
+  const payload = {
+    type: def.type,      // "message.updated"
+    properties,          // { info: msg }
+  }
+
+  const pending = []
+
+  // 1. 调用本地订阅者（按事件类型和通配符 "*"）
+  for (const key of [def.type, "*"]) {
+    const match = state().subscriptions.get(key)
+    for (const sub of match ?? []) {
+      pending.push(sub(payload))
+    }
+  }
+
+  // 2. 发送到全局事件总线（跨进程通信）
+  GlobalBus.emit("event", {
+    directory: Instance.directory,
+    payload,
+  })
+
+  return Promise.all(pending)
+}
+```
+
+#### 16.4.5 服务器端 SSE 端点
+
+**位置**: `src/server/server.ts:529-546`
+
+```typescript
+.get("/events", async (c) => {
+  return streamSSE(c, async (stream) => {
+    // 发送连接成功事件
+    stream.writeSSE({
+      data: JSON.stringify({
+        type: "server.connected",
+        properties: {},
+      }),
+    })
+
+    // 订阅所有 Bus 事件
+    const unsub = Bus.subscribeAll(async (event) => {
+      await stream.writeSSE({
+        data: JSON.stringify(event),  // 将事件发送给客户端
+      })
+    })
+
+    // 心跳保活
+    const heartbeat = setInterval(() => {
+      stream.writeSSE({ data: "{}" })
+    }, 30000)
+
+    // 等待连接关闭
+    await new Promise((resolve) => {
+      stream.onAbort(resolve)
+    })
+
+    unsub()
+    clearInterval(heartbeat)
+  })
+})
+```
+
+#### 16.4.6 客户端订阅处理
+
+**位置**: `src/cli/cmd/tui/context/sync.tsx:228-266`
+
+```typescript
+case "message.updated": {
+  const messages = store.message[event.properties.info.sessionID]
+  if (!messages) {
+    // 新 session，创建消息数组
+    setStore("message", event.properties.info.sessionID, [event.properties.info])
+    break
+  }
+
+  // 查找消息位置（使用二分查找，因为消息按 ID 排序）
+  const result = Binary.search(messages, event.properties.info.id, (m) => m.id)
+
+  if (result.found) {
+    // 更新现有消息
+    setStore("message", event.properties.info.sessionID, result.index, reconcile(event.properties.info))
+  } else {
+    // 插入新消息
+    setStore("message", event.properties.info.sessionID, produce((draft) => {
+      draft.splice(result.index, 0, event.properties.info)
+    }))
+  }
+
+  // 限制内存中的消息数量
+  if (messages.length > 100) {
+    // 移除最旧的消息
+    const oldest = messages[0]
+    // ...
+  }
+  break
+}
+```
+
+#### 16.4.7 GlobalBus 的作用
+
+**位置**: `src/bus/global.ts`
+
+```typescript
+import { EventEmitter } from "events"
+
+export const GlobalBus = new EventEmitter<{
+  event: [
+    {
+      directory?: string
+      payload: any
+    },
+  ]
+}>()
+```
+
+**作用**：
+- 提供跨模块的事件通信能力
+- 在 `src/server/routes/global.ts` 中用于跨 worktree 的事件同步
+- 支持多 worktree 场景下的事件共享
+
+#### 16.4.8 其他订阅者
+
+除了 SSE 端点，`MessageV2.Event.Updated` 还有其他订阅者：
+
+1. **ShareNext** - 自动同步消息到远程分享服务
+   ```typescript
+   Bus.subscribe(MessageV2.Event.Updated, async (evt) => {
+     await sync(evt.properties.info.sessionID, [{ type: "message", ... }])
+   })
+   ```
+
+2. **CLI Run 模式** - 处理一次性命令的输出
+   ```typescript
+   if (event.type === "message.updated" && event.properties.info.role === "assistant") {
+     // 处理输出...
+   }
+   ```
+
+### 16.5 事件类型汇总
+
+| 事件类型 | 触发时机 | 用途 |
+|---------|---------|------|
+| `message.updated` | 消息创建/更新 | UI 更新消息列表 |
+| `message.removed` | 消息删除 | UI 移除消息 |
+| `message.part.updated` | Part 创建/更新 | UI 更新消息内容 |
+| `message.part.delta` | Part 文本增量 | 实时文本流显示 |
+| `message.part.removed` | Part 删除 | UI 移除内容 |
+| `session.updated` | Session 更新 | UI 更新会话信息 |
+| `session.status` | 状态变化 | 显示 busy/idle/retry 状态 |
+| `permission.asked` | 请求权限 | 显示确认对话框 |
 
 ---
 
