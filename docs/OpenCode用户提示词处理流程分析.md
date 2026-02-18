@@ -1140,7 +1140,46 @@ for (let i = msgs.length - 1; i >= 0; i--) {
 const task = tasks.pop()  // 取最新一个待处理任务
 ```
 
-**所有 compaction part 都通过 `SessionCompaction.create` 插入**，没有其他来源。
+#### 7.2.4 compaction 的两种创建方式
+
+**所有 compaction part 都通过 `SessionCompaction.create` 插入**，但有两种触发方式：
+
+| 方式 | 触发位置 | `auto` 值 | 触发条件 |
+|------|---------|----------|---------|
+| 自动压缩 | `prompt.ts:561` 或 `prompt.ts:721` | `true` | token 溢出（`isOverflow` 返回 true） |
+| 手动压缩 | `session.ts:530` | `false`（默认） | 用户调用 `/compact` 命令或 API |
+
+**手动压缩的 API 入口**：
+
+**位置**：`src/server/routes/session.ts:508-542`
+
+```typescript
+.post(
+  "/:sessionID/summarize",
+  validator("json", z.object({
+    providerID: z.string(),
+    modelID: z.string(),
+    auto: z.boolean().optional().default(false),  // ← 默认 false
+  })),
+  async (c) => {
+    const body = c.req.valid("json")
+    await SessionCompaction.create({
+      sessionID,
+      agent: currentAgent,
+      model: { providerID: body.providerID, modelID: body.modelID },
+      auto: body.auto,  // ← 用户传入，默认 false
+    })
+    await SessionPrompt.loop({ sessionID })
+  }
+)
+```
+
+**`auto` 参数对后续处理的影响**：
+
+| `auto` 值 | 压缩完成后的行为 |
+|----------|----------------|
+| `true` | 创建 "Continue if you have next steps..." 合成消息，模型自动继续 |
+| `false` | 不创建合成消息，直接返回，等待用户下一步输入 |
 
 ### 7.3 Compaction 处理流程
 
@@ -1723,8 +1762,8 @@ const attachments = part.state.time.compacted
 | Token 如何计算 | **API 返回的实际值**，不是字符估算 |
 | create 做什么 | 插入一条用户消息 + 一条 compaction part |
 | 循环如何获取 | `filterCompacted` 从数据库读取，检测 compaction part |
-| task 来自哪里 | **只有 create 插入**，没有其他来源 |
-| task.auto 含义 | 标记是**自动**还是**手动**触发压缩 |
+| task 来自哪里 | **只有 create 插入**，但有两种触发方式：自动（token 溢出）或手动（`/compact` 命令） |
+| task.auto 含义 | `true` = 自动压缩，创建合成消息继续；`false` = 手动压缩，等待用户输入 |
 | 为什么传 msgs | 需要**完整历史**来生成摘要 |
 | prompt 如何生成 | 默认模板 + 插件可覆盖/扩展 |
 | result === "continue" | 模型正常完成，无错误 |
