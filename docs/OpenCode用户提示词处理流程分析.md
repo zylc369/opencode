@@ -262,6 +262,49 @@ await Session.updatePartDelta({
 })
 ```
 
+#### updateMessage 和 updatePart 的 Upsert 机制
+
+这两个函数虽然命名为 `update`，但实际是 **"创建或更新"（Upsert）** 操作：
+
+**位置**: `src/session/index.ts:581-601` 和 `src/session/index.ts:646-666`
+
+```typescript
+// 核心实现：INSERT ... ON CONFLICT DO UPDATE
+db.insert(MessageTable)
+  .values({...})
+  .onConflictDoUpdate({ target: MessageTable.id, set: { data } })
+  .run()
+```
+
+| 情况 | 行为 |
+|------|------|
+| id 不存在 | **插入**新记录（创建） |
+| id 已存在 | **更新**现有记录 |
+
+**返回值**：两个函数都返回传入的数据本身（`return msg` / `return part`）。
+
+**设计优点**：
+1. **统一接口**：不需要区分 create 和 update，简化调用方逻辑
+2. **幂等性**：多次调用同一个 id 不会产生重复数据
+3. **流式更新友好**：先创建消息框架，后续再更新内容（如添加 finish 状态）
+
+**使用示例**：
+```typescript
+// 1. 创建新消息
+const msg = await Session.updateMessage({
+  id: Identifier.ascending("message"),  // 新 id
+  sessionID,
+  role: "user",
+})
+
+// 2. 更新已有消息（使用同一个 id）
+await Session.updateMessage({
+  ...msg,  // 复用原消息的 id 和其他字段
+  finish: "stop",
+  time: { ...msg.time, completed: Date.now() }
+})
+```
+
 ### 2.8 查询完整消息
 
 ```typescript
