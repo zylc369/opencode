@@ -381,6 +381,223 @@ export const prompt = fn(PromptInput, async (input) => {
 
 这是整个处理流程的核心，主要逻辑如下：
 
+#### 3.2.1 loop 执行流程图
+
+```mermaid
+flowchart TD
+    subgraph Init["初始化阶段"]
+        A[loop 入口] --> B{resume_existing?}
+        B -->|是| C[resume 恢复会话]
+        B -->|否| D[start 启动会话]
+        C --> E[获取 abort controller]
+        D --> E
+    end
+
+    subgraph MainLoop["主循环 while(true)"]
+        E --> F[读取消息历史<br/>MessageV2.filterCompacted]
+        F --> G[倒序遍历查找<br/>lastUser/lastAssistant/lastFinished/tasks]
+
+        G --> H{lastAssistant.finish<br/>存在且非 tool-calls/unknown?}
+        H -->|是| I[break 退出循环]
+
+        H -->|否| J{task.type === 'subtask'?}
+        J -->|是| K[执行子任务 Subtask.process]
+        K --> L[continue 继续循环]
+        L --> F
+
+        J -->|否| M{task.type === 'compaction'?}
+        M -->|是| N[执行上下文压缩<br/>SessionCompaction.process]
+        N --> O[continue 继续循环]
+        O --> F
+
+        M -->|否| P[正常处理流程]
+        P --> Q[获取 Agent 配置]
+        Q --> R[创建 SessionProcessor]
+        R --> S[processor.process 处理请求]
+
+        S --> T{处理结果}
+        T -->|stop| I
+        T -->|compact| U[创建 SessionCompaction<br/>自动压缩]
+        U --> V[continue 继续循环]
+        V --> F
+        T -->|其他| F
+    end
+
+    subgraph End["结束阶段"]
+        I --> W[构建最终消息]
+        W --> X[return finalMessage]
+    end
+
+    style A fill:#e1f5fe
+    style I fill:#ffebee
+    style X fill:#e8f5e9
+    style P fill:#fff3e0
+    style S fill:#f3e5f5
+```
+
+#### 3.2.2 文字版执行流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              【初始化阶段】                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│    loop(sessionID, resume_existing)                                         │
+│                    │                                                        │
+│                    ▼                                                        │
+│         ┌─────────────────────┐                                             │
+│         │  resume_existing ?  │                                             │
+│         └─────────────────────┘                                             │
+│              │           │                                                  │
+│         是   │           │  否                                              │
+│              ▼           ▼                                                  │
+│        resume()     start()                                                 │
+│              │           │                                                  │
+│              └─────┬─────┘                                                  │
+│                    ▼                                                        │
+│           abort controller                                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           【主循环 while(true)】                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│    ┌──────────────────────────────────────────────────────────────────┐     │
+│    │  ① 读取消息历史: MessageV2.filterCompacted(stream)               │     │
+│    │  ② 倒序遍历查找: lastUser, lastAssistant, lastFinished, tasks    │     │
+│    └──────────────────────────────────────────────────────────────────┘     │
+│                                     │                                       │
+│                                     ▼                                       │
+│         ┌─────────────────────────────────────────────┐                     │
+│         │ lastAssistant.finish 存在                    │                     │
+│         │ 且 非 tool-calls/unknown ?                   │                     │
+│         └─────────────────────────────────────────────┘                     │
+│                      │                    │                                 │
+│                 是   │                    │  否                             │
+│                      ▼                    ▼                                 │
+│              ┌──────────────┐    ┌─────────────────────┐                    │
+│              │ break 退出    │    │ task.type ===       │                    │
+│              │  (→结束阶段)  │    │   'subtask' ?       │                    │
+│              └──────────────┘    └─────────────────────┘                    │
+│                                     │           │                           │
+│                                是   │           │  否                       │
+│                                     ▼           ▼                           │
+│                          ┌──────────────┐  ┌─────────────────────┐          │
+│                          │ Subtask.     │  │ task.type ===       │          │
+│                          │  process()   │  │   'compaction' ?    │          │
+│                          └──────────────┘  └─────────────────────┘          │
+│                                     │           │           │               │
+│                                     │      是   │           │  否           │
+│                                     │           ▼           ▼               │
+│                                     │  ┌──────────────┐  ┌────────────┐    │
+│                                     │  │ Compaction.  │  │ 正常处理    │    │
+│                                     │  │  process()   │  │ 流程       │    │
+│                                     │  └──────────────┘  └────────────┘    │
+│                                     │           │               │           │
+│                                     │           │               ▼           │
+│                                     │           │    ┌──────────────────┐  │
+│                                     │           │    │ 获取 Agent       │  │
+│                                     │           │    │ 创建 Processor   │  │
+│                                     │           │    │ processor.process│  │
+│                                     │           │    └──────────────────┘  │
+│                                     │           │               │           │
+│                                     │           │               ▼           │
+│                                     │           │    ┌──────────────────┐  │
+│                                     │           │    │   处理结果       │  │
+│                                     │           │    └──────────────────┘  │
+│                                     │           │        │    │    │       │
+│                                     │           │   stop │    │    │其他   │
+│                                     │           │        │ compact   │     │
+│                                     │           │        ▼    ▼    ▼       │
+│                                     │           │     (退出) (压缩)(继续)  │
+│                                     │           │           │              │
+│                                     │           │           ▼              │
+│                                     ▼           ▼        continue          │
+│                              ◄─────────────────────────────┘                │
+│                              │                                              │
+│                        continue                                             │
+│                              │                                              │
+│                              └───────────────────────────► (返回循环开始)   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                               【结束阶段】                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│           构建最终消息 finalMessage                                          │
+│                    │                                                        │
+│                    ▼                                                        │
+│           return finalMessage                                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**简化的线性流程**:
+
+```
+loop 入口
+    │
+    ├─ resume_existing? ──是──► resume(sessionID) ──┐
+    │                                                │
+    └─ resume_existing? ──否──► start(sessionID)  ──┴──► abort
+                                                          │
+                    ┌─────────────────────────────────────┘
+                    ▼
+            ┌───────────────────┐
+            │  while (true)     │ ◄─────────────────────────────┐
+            └───────────────────┘                               │
+                    │                                           │
+                    ▼                                           │
+            读取消息历史 + 倒序遍历                               │
+                    │                                           │
+                    ▼                                           │
+            ┌───────────────────┐                               │
+            │ finish 检查       │──是──► break ──► 结束阶段     │
+            └───────────────────┘                               │
+                    │ 否                                        │
+                    ▼                                           │
+            ┌───────────────────┐                               │
+            │ subtask?          │──是──► 执行 ──► continue ─────┤
+            └───────────────────┘                               │
+                    │ 否                                        │
+                    ▼                                           │
+            ┌───────────────────┐                               │
+            │ compaction?       │──是──► 执行 ──► continue ─────┤
+            └───────────────────┘                               │
+                    │ 否                                        │
+                    ▼                                           │
+            processor.process()                                  │
+                    │                                           │
+                    ├─ stop   ──► break ──► 结束阶段             │
+                    ├─ compact ──► 压缩 ──► continue ────────────┤
+                    └─ 其他   ──► continue ──────────────────────┘
+```
+
+#### 3.2.3 流程关键节点说明
+
+| 节点 | 说明 |
+|------|------|
+| **start/resume** | 首次调用走 `start()`，恢复会话走 `resume()`，都会返回 abort controller 用于取消请求 |
+| **filterCompacted** | 过滤已压缩的消息，只保留有效历史 |
+| **倒序遍历** | 快速定位最后的用户/助手消息，收集待处理任务（subtask/compaction） |
+| **finish 检查** | 如果 `finish` 为 `end`、`stop` 等值，表示模型已完成，退出循环 |
+| **subtask 处理** | 执行子任务（如工具调用），完成后 `continue` 进入下一轮循环 |
+| **compaction 处理** | 执行上下文压缩，压缩完成后 `continue` |
+| **processor.process** | 调用 LLM API 的核心方法，返回处理结果 |
+| **结果处理** | `stop` 直接退出，`compact` 触发自动压缩后继续 |
+
+#### 3.2.4 循环退出的条件
+
+1. **正常完成**: `lastAssistant.finish` 为 `end`、`stop` 等非 `tool-calls`/`unknown` 值
+2. **处理器返回 stop**: `processor.process()` 返回 `"stop"`
+3. **外部中断**: abort controller 被触发
+
+#### 3.2.5 核心代码结构
+
 ```typescript
 export const loop = fn(LoopInput, async (input) => {
   const { sessionID, resume_existing } = input
@@ -924,6 +1141,196 @@ if (task?.type === "subtask") {
 3. 调用 `TaskTool.execute()` 执行任务
 4. TaskTool 内部会调用 `loop()` 函数启动新的处理循环
 5. 更新 part 状态并继续主循环
+
+### 6.5 Subtask 执行流程图
+
+```mermaid
+flowchart TD
+    subgraph LoopMain["loop() 主循环"]
+        A[检测到 task.type === 'subtask'] --> B[初始化 TaskTool]
+    end
+
+    subgraph Prepare["准备阶段"]
+        B --> C[获取 taskModel]
+        C --> D[创建 assistantMessage]
+        D --> E[创建 tool part<br/>status: running]
+        E --> F[触发 tool.execute.before 插件]
+    end
+
+    subgraph Execute["执行阶段 - TaskTool.execute()"]
+        F --> G[权限检查<br/>bypassAgentCheck?]
+        G --> H[获取 agent 配置]
+        H --> I{task_id 存在?}
+
+        I -->|是| J[获取已有 session]
+        I -->|否| K[创建新 session<br/>parentID: ctx.sessionID]
+
+        J --> L[构建 promptParts]
+        K --> L
+
+        L --> M[调用 SessionPrompt.prompt]
+        M --> N[内部调用 loop 启动子会话]
+
+        N --> O[获取最终文本结果]
+        O --> P[构建 output<br/>task_id + task_result]
+    end
+
+    subgraph Complete["完成阶段"]
+        P --> Q{执行成功?}
+        Q -->|是| R[更新 part<br/>status: completed]
+        Q -->|否| S[更新 part<br/>status: error]
+
+        R --> T[触发 tool.execute.after 插件]
+        S --> T
+
+        T --> U[更新 assistantMessage<br/>finish: tool-calls]
+
+        U --> V{有 command?}
+        V -->|是| W[创建合成用户消息<br/>提示继续任务]
+        V -->|否| X[continue 继续主循环]
+        W --> X
+    end
+
+    style A fill:#e1f5fe
+    style M fill:#fff3e0
+    style N fill:#f3e5f5
+    style R fill:#e8f5e9
+    style S fill:#ffebee
+```
+
+**文字版流程图**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    【loop() 主循环 - 检测到 subtask】                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  if (task?.type === "subtask")                                              │
+│      │                                                                      │
+│      ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                         准备阶段                                     │   │
+│  ├─────────────────────────────────────────────────────────────────────┤   │
+│  │  1. TaskTool.init()                    获取任务工具实例              │   │
+│  │  2. 获取 taskModel                     确定使用的模型                 │   │
+│  │  3. 创建 assistantMessage              新的助手消息                   │   │
+│  │     - mode: task.agent                                                │   │
+│  │     - agent: task.agent                                               │   │
+│  │  4. 创建 tool part                     status: running               │   │
+│  │     - tool: TaskTool.id                                               │   │
+│  │     - input: prompt, description, subagent_type                      │   │
+│  │  5. Plugin.trigger("tool.execute.before")  执行前插件                 │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                      │
+│                                      ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              执行阶段 - TaskTool.execute()                           │   │
+│  ├─────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                      │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │  权限检查                                                    │    │   │
+│  │  │  if (!bypassAgentCheck) → ctx.ask(permission: "task")       │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                          │                                           │   │
+│  │                          ▼                                           │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │  获取/创建 Session                                           │    │   │
+│  │  │                                                              │    │   │
+│  │  │  task_id 存在?                                               │    │   │
+│  │  │     │                                                        │    │   │
+│  │  │     ├─ 是 → Session.get(task_id)  恢复已有会话               │    │   │
+│  │  │     │                                                        │    │   │
+│  │  │     └─ 否 → Session.create({            创建新会话           │    │   │
+│  │  │              parentID: ctx.sessionID,                        │    │   │
+│  │  │              permission: [...限制权限...]                    │    │   │
+│  │  │            })                                                │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                          │                                           │   │
+│  │                          ▼                                           │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │  执行子会话                                                  │    │   │
+│  │  │                                                              │    │   │
+│  │  │  resolvePromptParts(params.prompt)                          │    │   │
+│  │  │           │                                                  │    │   │
+│  │  │           ▼                                                  │    │   │
+│  │  │  SessionPrompt.prompt({                                      │    │   │
+│  │  │    sessionID: session.id,                                    │    │   │
+│  │  │    agent: agent.name,                                        │    │   │
+│  │  │    tools: { todowrite: false, task: false, ... }            │    │   │
+│  │  │  })                                                          │    │   │
+│  │  │           │                                                  │    │   │
+│  │  │           ▼                                                  │    │   │
+│  │  │  ┌─────────────────────────────────────────────────────┐    │    │   │
+│  │  │  │  内部调用 loop() 启动新的处理循环                     │    │    │   │
+│  │  │  │  (这是一个完整的子会话处理流程)                       │    │    │   │
+│  │  │  └─────────────────────────────────────────────────────┘    │    │   │
+│  │  │           │                                                  │    │   │
+│  │  │           ▼                                                  │    │   │
+│  │  │  返回 result (包含 parts)                                    │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                          │                                           │   │
+│  │                          ▼                                           │   │
+│  │  构建输出:                                                            │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │   │
+│  │  │  task_id: ${session.id} (for resuming)                       │    │   │
+│  │  │  <task_result>                                               │    │   │
+│  │  │    {最后一条文本内容}                                         │    │   │
+│  │  │  </task_result>                                              │    │   │
+│  │  └─────────────────────────────────────────────────────────────┘    │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                      │
+│                                      ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                         完成阶段                                     │   │
+│  ├─────────────────────────────────────────────────────────────────────┤   │
+│  │                                                                      │   │
+│  │  ┌───────────────────────┐                                          │   │
+│  │  │  执行结果成功?         │                                          │   │
+│  │  └───────────────────────┘                                          │   │
+│  │        │           │                                                │   │
+│  │       是           否                                               │   │
+│  │        │           │                                                │   │
+│  │        ▼           ▼                                                │   │
+│  │  ┌──────────┐  ┌──────────────┐                                    │   │
+│  │  │ status:  │  │ status:      │                                    │   │
+│  │  │ completed│  │ error        │                                    │   │
+│  │  └──────────┘  └──────────────┘                                    │   │
+│  │        │           │                                                │   │
+│  │        └─────┬─────┘                                                │   │
+│  │              ▼                                                      │   │
+│  │  Plugin.trigger("tool.execute.after")                               │   │
+│  │              │                                                      │   │
+│  │              ▼                                                      │   │
+│  │  更新 assistantMessage                                              │   │
+│  │    - finish = "tool-calls"                                          │   │
+│  │    - time.completed = Date.now()                                    │   │
+│  │              │                                                      │   │
+│  │              ▼                                                      │   │
+│  │  ┌───────────────────────┐                                          │   │
+│  │  │  有 command?           │──是──► 创建合成用户消息                  │   │
+│  │  └───────────────────────┘       "Summarize the task..."           │   │
+│  │        │                                                            │   │
+│  │       否                                                            │   │
+│  │        │                                                            │   │
+│  │        ▼                                                            │   │
+│  │  continue  (返回主循环继续)                                          │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.6 Subtask 执行的关键点
+
+| 关键点 | 说明 |
+|-------|------|
+| **同步执行** | Subtask 在同一个 Node.js 进程中执行，不使用 Worker |
+| **嵌套 loop** | TaskTool 内部调用 `SessionPrompt.prompt()` → 触发 `loop()` |
+| **Session 隔离** | 子任务有独立的 session，但 parentID 指向父 session |
+| **权限继承** | 子任务可继承父 session 的权限，并添加额外限制（如禁用 todowrite） |
+| **task_id 恢复** | 通过 task_id 可以恢复之前的子任务会话 |
+| **合成消息** | 如果有 command，会创建合成用户消息避免某些模型报错 |
 
 ---
 
@@ -2110,7 +2517,170 @@ export function create(input: {
 }
 ```
 
-#### 8.2.1 fullStream 的事件类型
+#### 8.2.1 processor.process 执行流程图
+
+**位置**: `src/session/processor.ts:45-417`
+
+```mermaid
+flowchart TD
+    subgraph Init["初始化"]
+        A[process 入口] --> B[needsCompaction = false]
+        B --> C[获取 shouldBreak 配置]
+    end
+
+    subgraph MainLoop["主循环 while(true)"]
+        C --> D[LLM.stream 调用大模型]
+        D --> E[for await value of fullStream]
+
+        E --> F{value.type}
+
+        F -->|start| G[设置状态 busy]
+        F -->|reasoning-start| H[创建 reasoning part]
+        F -->|reasoning-delta| I[更新 reasoning 增量]
+        F -->|reasoning-end| J[完成 reasoning part]
+        F -->|text-start| K[创建 text part]
+        F -->|text-delta| L[更新 text 增量]
+        F -->|text-end| M[完成 text part]
+        F -->|tool-input-start| N[创建 tool part<br/>status: pending]
+        F -->|tool-call| O[更新 tool part<br/>status: running<br/>检测 doom loop]
+        F -->|tool-result| P[更新 tool part<br/>status: completed]
+        F -->|tool-error| Q[更新 tool part<br/>status: error<br/>检查是否 blocked]
+        F -->|error| R[抛出错误]
+        F -->|start-step| S[Snapshot.track]
+        F -->|finish-step| T[更新 tokens/cost<br/>检查 isOverflow]
+        F -->|finish| U[流结束]
+
+        G --> V{needsCompaction?}
+        H --> V
+        I --> V
+        J --> V
+        K --> V
+        L --> V
+        M --> V
+        N --> V
+        O --> V
+        P --> V
+        Q --> V
+        S --> V
+        T --> V
+        U --> V
+
+        V -->|是| W[break 退出循环]
+        V -->|否| E
+    end
+
+    subgraph ErrorHandling["错误处理"]
+        R --> X{可重试?}
+        X -->|是| Y[attempt++<br/>等待延迟<br/>continue]
+        Y --> D
+        X -->|否| Z[设置 error<br/>发布 Error 事件]
+    end
+
+    subgraph Cleanup["清理阶段"]
+        W --> AA[处理未完成的 tool parts]
+        Z --> AA
+        AA --> AB[更新 message.completed]
+        AB --> AC{返回值判断}
+    end
+
+    subgraph Return["返回值"]
+        AC -->|needsCompaction| AD[return 'compact']
+        AC -->|blocked| AE[return 'stop']
+        AC -->|error| AF[return 'stop']
+        AC -->|正常| AG[return 'continue']
+    end
+
+    style A fill:#e1f5fe
+    style D fill:#fff3e0
+    style R fill:#ffebee
+    style AD fill:#e8f5e9
+    style AE fill:#ffebee
+    style AF fill:#ffebee
+    style AG fill:#e8f5e9
+```
+
+**文字版流程图**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              【初始化】                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  process(streamInput)                                                        │
+│      │                                                                       │
+│      ▼                                                                       │
+│  needsCompaction = false                                                     │
+│  shouldBreak = 配置项                                                         │
+│      │                                                                       │
+│      ▼                                                                       │
+│  ┌───────────────────────────────────────┐                                   │
+│  │         while (true)                  │ ◄─────────────────────────┐      │
+│  └───────────────────────────────────────┘                           │      │
+│      │                                                               │      │
+│      ▼                                                               │      │
+│  LLM.stream(streamInput)  ─────────────────► 大模型 API              │      │
+│      │                                                               │      │
+│      ▼                                                               │      │
+│  ┌───────────────────────────────────────┐                           │      │
+│  │  for await (value of fullStream)      │ ◄─────────┐               │      │
+│  └───────────────────────────────────────┘           │               │      │
+│      │                                               │               │      │
+│      ▼                                               │               │      │
+│  ┌───────────────────────────────────────────────────┤               │      │
+│  │              switch (value.type)                  │               │      │
+│  └───────────────────────────────────────────────────┤               │      │
+│      │                                               │               │      │
+│      ├─ start          → 设置状态 busy               │               │      │
+│      ├─ reasoning-*    → 处理推理内容                │               │      │
+│      ├─ text-*         → 处理文本内容                │               │      │
+│      ├─ tool-input-*   → 处理工具输入                │               │      │
+│      ├─ tool-call      → 执行工具(检测 doom loop)    │               │      │
+│      ├─ tool-result    → 更新工具结果                │               │      │
+│      ├─ tool-error     → 更新错误状态(可能 blocked)  │               │      │
+│      ├─ start-step     → 跟踪快照                    │               │      │
+│      ├─ finish-step    → 更新 tokens/cost            │               │      │
+│      │                    检查 isOverflow            │               │      │
+│      ├─ finish         → 流结束                      │               │      │
+│      └─ error          → 抛出错误 ───────────────────┼──► 异常处理   │      │
+│                                                      │               │      │
+│      ▼                                               │               │      │
+│  ┌───────────────────────┐                           │               │      │
+│  │  needsCompaction ?    │──是──► break ─────────────┼──► 清理阶段   │      │
+│  └───────────────────────┘                           │               │      │
+│      │ 否                                            │               │      │
+│      └───────────────────────────────────────────────┘               │      │
+│                                                                      │      │
+│  异常处理:                                                            │      │
+│  ┌───────────────────────┐                                           │      │
+│  │  可重试错误 ?          │──是──► 等待延迟 ─────────────────────────┘      │
+│  └───────────────────────┘                                                │
+│      │ 否                                                                 │
+│      ▼                                                                    │
+│  设置 error → 发布事件 → 清理阶段                                          │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              【清理阶段】                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 处理未完成的 tool parts (status 设为 error)                              │
+│  2. 更新 message.time.completed                                             │
+│  3. Session.updateMessage 保存消息                                          │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────┐         │
+│  │                      返回值判断                                │         │
+│  ├───────────────────────────────────────────────────────────────┤         │
+│  │  needsCompaction ? ──是──► return "compact"                   │         │
+│  │  blocked ?         ──是──► return "stop"                      │         │
+│  │  error ?           ──是──► return "stop"                      │         │
+│  │  正常              ──►   return "continue"                    │         │
+│  └───────────────────────────────────────────────────────────────┘         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.2.2 fullStream 的事件类型
 
 `stream.fullStream` 中的 `value.type` 是 **AI SDK 格式化后的统一结构**，不是大模型 API 直接返回的原始格式。
 
@@ -2130,7 +2700,7 @@ export function create(input: {
 | `finish-step` | 步骤完成（包含 usage、finishReason） |
 | `error` | 错误 |
 
-#### 8.2.2 AI SDK 的架构和转换
+#### 8.2.3 AI SDK 的架构和转换
 
 不同模型 API 返回的原始格式不同，AI SDK 将它们统一转换为标准格式：
 
@@ -4195,7 +4765,7 @@ MessageV2.toModelMessages()  # 转换为模型格式
 - `plan` agent: 添加规划模式提示
 - 从 `plan` 切换到 `build`: 添加切换提示
 
----
+
 
 ## 14. 系统提示词注入
 
@@ -4250,7 +4820,7 @@ system.push([
 ].filter((x) => x).join("\n"))
 ```
 
----
+
 
 ## 15. Session 数据压缩与清理
 
