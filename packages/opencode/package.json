@@ -11,6 +11,7 @@
     "build": "bun run script/build.ts",
     "dev": "bun run --conditions=browser ./src/index.ts",
     "dev:web": "bun run --conditions=browser ./src/index.ts web",
+    "dev:web:local": "bun run --conditions=browser ./src/index.ts web --unmatched-request-proxy http://localhost:4173/",
     "random": "echo 'Random script updated at $(date)' && echo 'Change queued successfully' && echo 'Another change made' && echo 'Yet another change' && echo 'One more change' && echo 'Final change' && echo 'Another final change' && echo 'Yet another final change'",
     "clean": "echo 'Cleaning up...' && rm -rf node_modules dist",
     "lint": "echo 'Running lint checks...' && bun test --coverage",

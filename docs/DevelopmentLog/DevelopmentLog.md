@@ -122,6 +122,18 @@ opencode web启动后打开`http://127.0.0.1:4096/`网页，下面是这个网�
 
 
 
+#### 新增启动命令
+
+我在`packages/opencode/package.json`中新增启动命令：
+
+```shell
+"dev:web:local": "bun run --conditions=browser ./src/index.ts web --unmatched-request-proxy http://localhost:4173/"
+```
+
+为什么端口设置为**4173**？因为在`packages/app`目录下运行`bun run serve`之后暴露的是这个端口号。
+
+
+
 ### 开发环境web页面打开白屏
 
 #### 背景
@@ -154,7 +166,7 @@ package.json的问题解决了，现在又出现了字体的问题，字体使�
 
 此时，我在想为什么`const response = await proxy`语句代理到远程域名`https://app.opencode.ai`就可以正确的访问到资源，我本地为什么不行？它们的区别在哪里？
 
-我最大的区别可能在于：我是开发命令启动的，远程域名运行的应该是发布版的构建产物，我使用`vite build`构建，再使用`vite preview`预览，预览的网站是`http://localhost:4173`。我将之前在`.all`里面改的`localhost:3000`在改成`localhost:4173`，然后重启，此时`http://127.0.0.1:4096/`正确的显示出前端页面。
+我最大的区别可能在于：我是开发命令启动的，远程域名运行的应该是发布版的构建产物，我使用`bun run build`命令间接调用`vite build`做构建，再使用`bun run serve`间接调用`vite preview`做预览，预览的网站是`http://localhost:4173`。我将之前在`.all`里面改的`localhost:3000`在改成`localhost:4173`，然后重启，此时`http://127.0.0.1:4096/`正确的显示出前端页面。
 
 
 

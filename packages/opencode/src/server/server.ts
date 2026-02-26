@@ -41,6 +41,8 @@ import { PermissionRoutes } from "./routes/permission"
 import { GlobalRoutes } from "./routes/global"
 import { MDNS } from "./mdns"
 import { Identifier } from "@/id/id"
+import { Runtime } from "@/runtime"
+import { UrlHelper } from "@opencode-ai/util/url-helper"
 
 const CONTEXT_KEY_SERVER_LOG = "serverInstanceLog"
 
@@ -565,6 +567,9 @@ export namespace Server {
         .all("/*", async (c) => {
           const log = c.get(CONTEXT_KEY_SERVER_LOG)
           const path = c.req.path
+          const unMatchedRequestProxy = Runtime.Global.getUnMatchedRequestProxy()
+          const proxyUrl = `${unMatchedRequestProxy}${path}`
+          const host = UrlHelper.getHostWithPort(unMatchedRequestProxy)
 
           // const timer = log.time("request", {
           //   traceId: c.res.headers.get("X-TRACE-ID"),
@@ -573,13 +578,15 @@ export namespace Server {
           // })
           log.info(`[all]`)
 
-          const response = await proxy(`https://app.opencode.ai${path}`, {
+          const params: RequestInit = {
             ...c.req,
             headers: {
               ...c.req.raw.headers,
-              host: "app.opencode.ai",
+              host,
             },
-          })
+          }
+
+          const response = await proxy(proxyUrl, params)
           response.headers.set(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:",
