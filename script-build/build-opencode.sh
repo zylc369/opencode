@@ -7,7 +7,7 @@
 # Usage: ./script-build/build-opencode.sh <VERSION> [options]
 #
 # Arguments:
-#   VERSION    Release version (e.g., v1.2.16 or 1.2.16)
+#   VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)
 #
 # Options:
 #   --validate  Dry-run mode - only run validations, no release
@@ -50,8 +50,8 @@ trap cleanup ERR EXIT INT
 
 validate_version() {
     local version="$1"
-    if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_error "Invalid version format: ${version}\nExpected format: v1.2.16 or 1.2.16 (semver)"
+    if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9]+)?$ ]]; then
+        log_error "Invalid version format: ${version}\nExpected format: v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai"
         return 1
     fi
     log_info "Version validated: ${version}"
@@ -225,8 +225,7 @@ main() {
             -h|--help)
                 echo "Usage: $0 <VERSION> [--repo REPO] [options]"
                 echo ""
-                echo "Arguments:"
-                echo "  VERSION    Release version (e.g., v1.2.16 or 1.2.16)"
+                echo "  VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)"
                 echo ""
                 echo "Options:"
                 echo "  --repo REPO    Target repository (e.g., owner/repo, overrides gh default)"

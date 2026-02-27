@@ -175,28 +175,28 @@ export const { use: useHighlights, provider: HighlightsProvider } = createSimple
         clearTimer()
       })
 
-      fetcher(CHANGELOG_URL, {
-        signal: controller.signal,
-        headers: { Accept: "application/json" },
-      })
-        .then((response) => (response.ok ? (response.json() as Promise<unknown>) : undefined))
-        .then((json) => {
-          if (!json) return
-          const highlights = loadReleaseHighlights(json, platform.version, previous)
-          if (controller.signal.aborted) return
+      // fetcher(CHANGELOG_URL, {
+      //   signal: controller.signal,
+      //   headers: { Accept: "application/json" },
+      // })
+      //   .then((response) => (response.ok ? (response.json() as Promise<unknown>) : undefined))
+      //   .then((json) => {
+      //     if (!json) return
+      //     const highlights = loadReleaseHighlights(json, platform.version, previous)
+      //     if (controller.signal.aborted) return
 
-          if (highlights.length === 0) {
-            markSeen()
-            return
-          }
+      //     if (highlights.length === 0) {
+      //       markSeen()
+      //       return
+      //     }
 
-          timer = setTimeout(() => {
-            timer = undefined
-            markSeen()
-            dialog.show(() => <DialogReleaseNotes highlights={highlights} />)
-          }, 500)
-        })
-        .catch(() => undefined)
+      //     timer = setTimeout(() => {
+      //       timer = undefined
+      //       markSeen()
+      //       dialog.show(() => <DialogReleaseNotes highlights={highlights} />)
+      //     }, 500)
+      //   })
+      //   .catch(() => undefined)
     }
 
     createEffect(() => {
