@@ -166,18 +166,20 @@ verify_release() {
         return 1
     fi
     
-    # Get release info
+    # Get release info in one call for efficiency
+    local release_json
+    release_json=$(gh ${repo_arg} release view "${version}" --json url,name,isPrerelease,isDraft,assets)
     local release_url
     local release_title
     local is_prerelease
     local is_draft
     local asset_count
     
-    release_url=$(gh ${repo_arg} release view "${version}" --json '.url')
-    release_title=$(gh ${repo_arg} release view "${version}" --json '.title')
-    is_prerelease=$(gh ${repo_arg} release view "${version}" --json '.prerelease')
-    is_draft=$(gh ${repo_arg} release view "${version}" --json '.draft')
-    asset_count=$(gh ${repo_arg} release view "${version}" --json '.assets | length')
+    release_url=$(echo "${release_json}" | jq -r '.url')
+    release_title=$(echo "${release_json}" | jq -r '.name')
+    is_prerelease=$(echo "${release_json}" | jq -r '.isPrerelease')
+    is_draft=$(echo "${release_json}" | jq -r '.isDraft')
+    asset_count=$(echo "${release_json}" | jq '.assets | length')
     
     log_info "Release URL: ${release_url}"
     log_info "Release title: ${release_title}"
