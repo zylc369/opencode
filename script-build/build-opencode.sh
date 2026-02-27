@@ -128,6 +128,46 @@ detect_git_repo() {
     return 0
 }
 
+build_packages() {
+    local script_dir
+    local repo_root
+    
+    # Get script directory and repo root
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    repo_root="${script_dir}/.."
+    
+    log_info "Starting build process..."
+    
+    # Build packages/opencode
+    log_info "Building packages/opencode..."
+    cd "${repo_root}/packages/opencode" || {
+        log_error "Failed to cd to packages/opencode"
+        return 1
+    }
+    bun run build || {
+        log_error "Failed to build packages/opencode"
+        log_info "Build log may contain more details"
+        return 1
+    }
+    log_info "packages/opencode build succeeded"
+    
+    # Build packages/app
+    log_info "Building packages/app..."
+    cd "${repo_root}/packages/app" || {
+        log_error "Failed to cd to packages/app"
+        return 1
+    }
+    bun run build || {
+        log_error "Failed to build packages/app"
+        log_info "Build log may contain more details"
+        return 1
+    }
+    log_info "packages/app build succeeded"
+    
+    log_info "All builds completed successfully"
+    return 0
+}
+
 # Release functions
 
 check_release_exists() {
@@ -336,6 +376,11 @@ main() {
             log_info "Using gh CLI default repository"
         fi
     fi
+
+    # Build packages
+    build_packages
+
+    # Create release
 
     # Create release
     log_info "Starting release creation..."
