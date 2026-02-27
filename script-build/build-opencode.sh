@@ -73,6 +73,61 @@ check_gh_auth() {
     log_info "gh CLI authentication verified"
 }
 
+detect_git_repo() {
+    local repo
+    local remote_url
+    
+    # Try to get remote URL from git
+    if ! command -v git &> /dev/null; then
+        log_info "git not found, will use gh CLI default repository"
+        return 0
+    fi
+    
+    if ! git rev-parse --git-dir &> /dev/null; then
+        log_info "Not in a git repository, will use gh CLI default repository"
+        return 0
+    fi
+    
+    # Get remote URL (prefer origin)
+    remote_url=$(git remote get-url origin 2>/dev/null)
+    if [[ -z "${remote_url}" ]]; then
+        # Try to get any remote
+        remote_url=$(git remote -v | head -1 | awk '{print $2}')
+    fi
+    
+    if [[ -z "${remote_url}" ]]; then
+        log_info "No git remote found, will use gh CLI default repository"
+        return 0
+    fi
+    
+    # Parse remote URL to extract owner/repo
+    # Remove .git suffix
+    local clean_url
+    clean_url="${remote_url%.git}"
+    
+    # Extract owner/repo based on URL format
+    if [[ "${clean_url}" =~ ^https?://github\.com/ ]]; then
+        # GitHub HTTPS URL: https://github.com/owner/repo
+        repo="${clean_url#https://github.com/}"
+        repo="${repo#http://github.com/}"
+    elif [[ "${clean_url}" =~ ^git@github\.com: ]]; then
+        # GitHub SSH URL: git@github.com:owner/repo
+        repo="${clean_url#*:}"
+    elif [[ "${clean_url}" =~ ^https?:// ]]; then
+        # Generic HTTPS URL
+        repo=$(echo "${clean_url}" | sed -E 's|^[^:/]+[:/]+||')
+    elif [[ "${clean_url}" =~ ^git@[^:]+: ]]; then
+        # Generic SSH URL
+        repo="${clean_url#*:}"
+    else
+        log_info "Unable to parse remote URL: ${remote_url}"
+        return 0
+    fi
+    
+    echo "${repo}"
+    return 0
+}
+
 # Release functions
 
 check_release_exists() {
@@ -234,7 +289,7 @@ main() {
                 echo "  VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)"
                 echo ""
                 echo "Options:"
-                echo "  --repo REPO    Target repository (e.g., owner/repo, overrides gh default)"
+                echo "  --repo REPO    Target repository (e.g., owner/repo, defaults to git remote if not specified)"
                 echo "  --validate      Dry-run mode - only run validations, no release"
                 echo "  -h, --help      Show this help message"
                 exit 0
@@ -271,6 +326,15 @@ main() {
     if [[ "${validate_only}" == true ]]; then
         log_info "Validation complete (dry-run mode)"
         exit 0
+    fi
+    # Detect git repository if --repo not provided
+    if [[ -z "${repo}" ]]; then
+        repo=$(detect_git_repo)
+        if [[ -n "${repo}" ]]; then
+            log_info "Auto-detected repository: ${repo}"
+        else
+            log_info "Using gh CLI default repository"
+        fi
     fi
 
     # Create release
