@@ -95,8 +95,12 @@ create_release() {
     local version="$1"
     local repo="$2"
     local release_title
-    local intermediate_dir="script-build/intermediate"
+    local script_dir
+    local intermediate_dir
     
+    # Get script directory to resolve relative paths
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    intermediate_dir="${script_dir}/intermediate"
     # Ensure version has 'v' prefix
     if [[ ! "${version}" =~ ^v ]]; then
         version="v${version}"
