@@ -16,6 +16,13 @@
 
 set -euo pipefail
 
+# Get absolute path to script directory (once at script start)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Utility functions
+
+# Utility functions
+
 
 # Utility functions
 
@@ -129,12 +136,13 @@ detect_git_repo() {
 }
 
 build_packages() {
-    local script_dir
+    local version="$1"
     local repo_root
+    local intermediate_dir
     
-    # Get script directory and repo root
-    script_dir="$(cd "$(dirname "$0")" && pwd)"
-    repo_root="${script_dir}/.."
+    # Use global SCRIPT_DIR set at script start
+    repo_root="${SCRIPT_DIR}/.."
+    intermediate_dir="${SCRIPT_DIR}/intermediate"
     
     log_info "Starting build process..."
     
@@ -144,13 +152,11 @@ build_packages() {
         log_error "Failed to cd to packages/opencode"
         return 1
     }
-    bun run build || {
+    OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod GH_REPO= bun run script/build.ts || {
         log_error "Failed to build packages/opencode"
         log_info "Build log may contain more details"
         return 1
     }
-    log_info "packages/opencode build succeeded"
-    
     # Build packages/app
     log_info "Building packages/app..."
     cd "${repo_root}/packages/app" || {
@@ -163,6 +169,36 @@ build_packages() {
         return 1
     }
     log_info "packages/app build succeeded"
+    
+    # Prepare intermediate directory
+    log_info "Preparing intermediate directory..."
+    mkdir -p "${intermediate_dir}"
+    cd "${intermediate_dir}"
+    
+    # Copy tar.gz files from packages/opencode/dist
+    log_info "Copying build artifacts to intermediate directory..."
+    for file in "${repo_root}/packages/opencode/dist"/*.tar.gz "${repo_root}/packages/opencode/dist"/*.zip; do
+        if [[ -f "${file}" ]]; then
+            cp "${file}" .
+            log_info "Copied: $(basename "${file}")"
+        fi
+    done
+    
+    # Generate checksums.txt
+    log_info "Generating checksums.txt..."
+    if command -v shasum &> /dev/null; then
+        # macOS uses shasum
+        shasum -a 256 *.tar.gz *.zip 2>/dev/null > checksums.txt
+    elif command -v sha256sum &> /dev/null; then
+        # Linux uses sha256sum
+        sha256sum *.tar.gz *.zip 2>/dev/null > checksums.txt
+    else
+        log_error "Neither shasum nor sha256sum found"
+        return 1
+    fi
+    
+    log_info "Checksums generated:"
+    cat checksums.txt
     
     log_info "All builds completed successfully"
     return 0
@@ -190,12 +226,10 @@ create_release() {
     local version="$1"
     local repo="$2"
     local release_title
-    local script_dir
     local intermediate_dir
     
-    # Get script directory to resolve relative paths
-    script_dir="$(cd "$(dirname "$0")" && pwd)"
-    intermediate_dir="${script_dir}/intermediate"
+    # Use global SCRIPT_DIR set at script start
+    intermediate_dir="${SCRIPT_DIR}/intermediate"
     # Ensure version has 'v' prefix
     if [[ ! "${version}" =~ ^v ]]; then
         version="v${version}"
@@ -233,6 +267,7 @@ create_release() {
         --notes "" \
     --prerelease=false \
         "${intermediate_dir}"/*.tar.gz \
+        "${intermediate_dir}"/*.zip \
         "${intermediate_dir}/checksums.txt"; then
         log_error "Failed to create release ${version}"
         return 1
@@ -245,7 +280,7 @@ create_release() {
 verify_release() {
     local version="$1"
     local repo="$2"
-    local expected_assets=13  # 12 tar.gz files + 1 checksums.txt
+    local expected_assets=12  # 11 package files (6 tar.gz + 5 zip) + 1 checksums.txt
     
     # Ensure version has 'v' prefix
     if [[ ! "${version}" =~ ^v ]]; then
@@ -378,7 +413,7 @@ main() {
     fi
 
     # Build packages
-    build_packages
+    build_packages "${version}"
 
     # Create release
 
