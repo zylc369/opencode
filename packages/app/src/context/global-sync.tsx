@@ -11,7 +11,6 @@ import { showToast } from "@opencode-ai/ui/toast"
 import { getFilename } from "@opencode-ai/util/path"
 import {
   createContext,
-  createEffect,
   getOwner,
   Match,
   onCleanup,
@@ -35,7 +34,6 @@ import { trimSessions } from "./global-sync/session-trim"
 import type { ProjectMeta } from "./global-sync/types"
 import { SESSION_RECENT_LIMIT } from "./global-sync/types"
 import { sanitizeProject } from "./global-sync/utils"
-import { usePlatform } from "./platform"
 import { formatServerError } from "@/utils/server-errors"
 import { Log } from "@/utils/log"
 
@@ -57,7 +55,6 @@ type GlobalStore = {
 
 function createGlobalSync() {
   const globalSDK = useGlobalSDK()
-  const platform = usePlatform()
   const language = useLanguage()
   const owner = getOwner()
   if (!owner) throw new Error("GlobalSync must be created within owner")
@@ -67,7 +64,7 @@ function createGlobalSync() {
   const sessionLoads = new Map<string, Promise<void>>()
   const sessionMeta = new Map<string, { limit: number }>()
 
-  const [projectCache, setProjectCache, , projectCacheReady] = persisted(
+  const [projectCache, setProjectCache, projectInit] = persisted(
     Persist.global("globalSync.project", ["globalSync.project.v1"]),
     createStore({ value: [] as Project[] }),
   )
@@ -82,6 +79,57 @@ function createGlobalSync() {
     config: {},
     reload: undefined,
   })
+
+  let active = true
+  let projectWritten = false
+
+  onCleanup(() => {
+    active = false
+  })
+
+  const cacheProjects = () => {
+    setProjectCache(
+      "value",
+      untrack(() => globalStore.project.map(sanitizeProject)),
+    )
+  }
+
+  const setProjects = (next: Project[] | ((draft: Project[]) => void)) => {
+    projectWritten = true
+    if (typeof next === "function") {
+      setGlobalStore("project", produce(next))
+      cacheProjects()
+      return
+    }
+    setGlobalStore("project", next)
+    cacheProjects()
+  }
+
+  const setBootStore = ((...input: unknown[]) => {
+    if (input[0] === "project" && Array.isArray(input[1])) {
+      setProjects(input[1] as Project[])
+      return input[1]
+    }
+    return (setGlobalStore as (...args: unknown[]) => unknown)(...input)
+  }) as typeof setGlobalStore
+
+  const set = ((...input: unknown[]) => {
+    if (input[0] === "project" && (Array.isArray(input[1]) || typeof input[1] === "function")) {
+      setProjects(input[1] as Project[] | ((draft: Project[]) => void))
+      return input[1]
+    }
+    return (setGlobalStore as (...args: unknown[]) => unknown)(...input)
+  }) as typeof setGlobalStore
+
+  if (projectInit instanceof Promise) {
+    void projectInit.then(() => {
+      if (!active) return
+      if (projectWritten) return
+      const cached = projectCache.value
+      if (cached.length === 0) return
+      setGlobalStore("project", cached)
+    })
+  }
 
   const setSessionTodo = (sessionID: string, todos: Todo[] | undefined) => {
     if (!sessionID) return
@@ -129,30 +177,6 @@ function createGlobalSync() {
     sdkCache.set(directory, sdk)
     return sdk
   }
-
-  createEffect(() => {
-    if (!projectCacheReady()) return
-    if (globalStore.project.length !== 0) return
-    const cached = projectCache.value
-    if (cached.length === 0) return
-    setGlobalStore("project", cached)
-  })
-
-  createEffect(() => {
-    if (!projectCacheReady()) return
-    const projects = globalStore.project
-    if (projects.length === 0) {
-      const cachedLength = untrack(() => projectCache.value.length)
-      if (cachedLength !== 0) return
-    }
-    setProjectCache("value", projects.map(sanitizeProject))
-  })
-
-  createEffect(() => {
-    if (globalStore.reload !== "complete") return
-    setGlobalStore("reload", undefined)
-    queue.refresh()
-  })
 
   async function loadSessions(directory: string) {
     const pending = sessionLoads.get(directory)
@@ -207,7 +231,7 @@ function createGlobalSync() {
         showToast({
           variant: "error",
           title: language.t("toast.session.listFailed.title", { project }),
-          description: formatServerError(err),
+          description: formatServerError(err, language.t),
         })
       })
 
@@ -237,6 +261,7 @@ function createGlobalSync() {
         setStore: child[1],
         vcsCache: cache,
         loadSessions,
+        translate: language.t,
       })
     })()
 
@@ -262,13 +287,7 @@ function createGlobalSync() {
         event,
         project: globalStore.project,
         refresh: queue.refresh,
-        setGlobalProject(next) {
-          if (typeof next === "function") {
-            setGlobalStore("project", produce(next))
-            return
-          }
-          setGlobalStore("project", next)
-        },
+        setGlobalProject: setProjects,
       })
       if (event.type === "server.connected" || event.type === "global.disposed") {
         for (const directory of Object.keys(children.children)) {
@@ -316,7 +335,9 @@ function createGlobalSync() {
         url: globalSDK.url,
       }),
       requestFailedTitle: language.t("common.requestFailed"),
-      setGlobalStore,
+      translate: language.t,
+      formatMoreCount: (count) => language.t("common.moreCountSuffix", { count }),
+      setGlobalStore: setBootStore,
     })
   }
 
@@ -340,7 +361,9 @@ function createGlobalSync() {
       .update({ config })
       .then(bootstrap)
       .then(() => {
-        setGlobalStore("reload", "complete")
+        queue.refresh()
+        setGlobalStore("reload", undefined)
+        queue.refresh()
       })
       .catch((error) => {
         setGlobalStore("reload", undefined)
@@ -350,7 +373,7 @@ function createGlobalSync() {
 
   return {
     data: globalStore,
-    set: setGlobalStore,
+    set,
     get ready() {
       return globalStore.ready
     },

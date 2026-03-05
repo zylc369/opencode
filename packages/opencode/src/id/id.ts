@@ -12,6 +12,7 @@ export namespace Identifier {
     pty: "pty",
     tool: "tool",
     trace: "trace",
+    workspace: "wrk",
   } as const
 
   export function schema(prefix: keyof typeof prefixes) {
