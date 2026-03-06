@@ -150,7 +150,7 @@ build_packages() {
         log_error "Failed to cd to packages/opencode"
         return 1
     }
-    OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod bun run script/build.ts || {
+    OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod GH_REPO="${repo}" bun run script/build.ts || {
         log_error "Failed to build packages/opencode"
         log_info "Build log may contain more details"
         return 1
@@ -236,6 +236,34 @@ check_release_exists() {
         return 1
     fi
     log_info "Release ${version} does not exist (good)"
+}
+
+create_empty_release() {
+    local version="$1"
+    local repo="$2"
+    local release_title
+    
+    # Ensure version has 'v' prefix
+    if [[ ! "${version}" =~ ^v ]]; then
+        version="v${version}"
+    fi
+    
+    # Set release title
+    release_title="OpenCode ${version}"
+    
+    local repo_arg="${repo:+-R }${repo}"
+    # Create release without files
+    log_info "Creating empty release ${version} with title '${release_title}'..."
+    if ! gh ${repo_arg} release create "${version}" \
+        --title "${release_title}" \
+        --notes "" \
+        --prerelease=false; then
+        log_error "Failed to create release ${version}"
+        return 1
+    fi
+    
+    log_info "Empty release ${version} created successfully"
+    return 0
 }
 
 create_release() {
@@ -436,15 +464,27 @@ main() {
         fi
     fi
 
-    # Build packages
+    # Create empty release first (before build, so TypeScript script can upload)
+    log_info "Creating empty release..."
+    check_release_exists "${version}" "${repo}"
+    create_empty_release "${version}" "${repo}"
+
+    # Build packages (TypeScript script will upload files now)
     build_packages "${version}" "${repo}"
 
-    # Create release
+    # Upload additional files (opencode-web and checksums)
+    log_info "Uploading additional files to release..."
+    local intermediate_dir="${SCRIPT_DIR}/intermediate"
+    local repo_arg="${repo:+-R }${repo}"
+    if ! gh ${repo_arg} release upload "v${version}" \
+        --clobber \
+        "${intermediate_dir}"/*.tar.gz \
+        "${intermediate_dir}"/*.zip \
+        "${intermediate_dir}/checksums.txt" 2>/dev/null; then
+        log_info "No additional files to upload"
+    fi
 
-    # Create release
-    log_info "Starting release creation..."
-    check_release_exists "${version}" "${repo}"
-    create_release "${version}" "${repo}"
+    # Verify release
     verify_release "${version}" "${repo}"
     log_info "Release creation complete!"
 }
