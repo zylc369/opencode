@@ -21,8 +21,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Utility functions
 
-# Utility functions
-
 
 # Utility functions
 
@@ -137,9 +135,9 @@ detect_git_repo() {
 
 build_packages() {
     local version="$1"
+    local repo="$2"
     local repo_root
     local intermediate_dir
-    
     # Use global SCRIPT_DIR set at script start
     repo_root="${SCRIPT_DIR}/.."
     intermediate_dir="${SCRIPT_DIR}/intermediate"
@@ -152,7 +150,7 @@ build_packages() {
         log_error "Failed to cd to packages/opencode"
         return 1
     }
-    OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod GH_REPO= bun run script/build.ts || {
+    OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod bun run script/build.ts || {
         log_error "Failed to build packages/opencode"
         log_info "Build log may contain more details"
         return 1
@@ -169,6 +167,24 @@ build_packages() {
         return 1
     }
     log_info "packages/app build succeeded"
+    
+    # Create tar.gz from packages/app/dist
+    log_info "Creating opencode-web.tar.gz from packages/app/dist..."
+    if [[ -d "${repo_root}/packages/app/dist" ]]; then
+        cd "${repo_root}/packages/app"
+        # Use a temporary directory to get the right directory name in the archive
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        mkdir -p "${tmp_dir}/opencode-web"
+        cp -r dist/* "${tmp_dir}/opencode-web/"
+        cd "${tmp_dir}"
+        tar -czf "${intermediate_dir}/opencode-web.tar.gz" opencode-web/
+        cd "${repo_root}/packages/app"
+        rm -rf "${tmp_dir}"
+        log_info "Created: opencode-web.tar.gz"
+    else
+        log_info "Warning: packages/app/dist not found, skipping opencode-web.tar.gz"
+    fi
     
     # Prepare intermediate directory
     log_info "Preparing intermediate directory..."
@@ -260,27 +276,35 @@ create_release() {
     release_title="OpenCode ${version}"
     
     local repo_arg="${repo:+-R }${repo}"
-    # Create release with assets
+    # Create release without files first
     log_info "Creating release ${version} with title '${release_title}'..."
     if ! gh ${repo_arg} release create "${version}" \
         --title "${release_title}" \
         --notes "" \
-    --prerelease=false \
-        "${intermediate_dir}"/*.tar.gz \
-        "${intermediate_dir}"/*.zip \
-        "${intermediate_dir}/checksums.txt"; then
+        --prerelease=false; then
         log_error "Failed to create release ${version}"
         return 1
     fi
     
-    log_info "Release ${version} created successfully"
+    # Now upload all files from intermediate directory
+    log_info "Uploading files to release ${version}..."
+    if ! gh ${repo_arg} release upload "${version}" \
+        --clobber \
+        "${intermediate_dir}"/*.tar.gz \
+        "${intermediate_dir}"/*.zip \
+        "${intermediate_dir}/checksums.txt"; then
+        log_error "Failed to upload files to release ${version}"
+        return 1
+    fi
+    
+    log_info "Release ${version} created and files uploaded successfully"
     return 0
 }
 
 verify_release() {
     local version="$1"
     local repo="$2"
-    local expected_assets=12  # 11 package files (6 tar.gz + 5 zip) + 1 checksums.txt
+    local expected_assets=13  # 12 package files (7 tar.gz + 5 zip) + 1 checksums.txt
     
     # Ensure version has 'v' prefix
     if [[ ! "${version}" =~ ^v ]]; then
@@ -413,7 +437,7 @@ main() {
     fi
 
     # Build packages
-    build_packages "${version}"
+    build_packages "${version}" "${repo}"
 
     # Create release
 
