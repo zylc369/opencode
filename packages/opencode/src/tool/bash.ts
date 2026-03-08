@@ -17,6 +17,8 @@ import { Shell } from "@/shell/shell"
 import { BashArity } from "@/permission/arity"
 import { Truncate } from "./truncation"
 import { Plugin } from "@/plugin"
+import { containsBlockedPath, getBlockedCommandError, filterSensitiveEnv } from "../security/path-filter"
+
 
 const MAX_METADATA_LENGTH = 30_000
 const DEFAULT_TIMEOUT = Flag.OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS || 2 * 60 * 1000
@@ -81,6 +83,12 @@ export const BashTool = Tool.define("bash", async () => {
         throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
       }
       const timeout = params.timeout ?? DEFAULT_TIMEOUT
+
+      // Security: Check for blocked commands
+      if (containsBlockedPath(params.command)) {
+        throw new Error(getBlockedCommandError(params.command))
+      }
+
       const tree = await parser().then((p) => p.parse(params.command))
       if (!tree) {
         throw new Error("Failed to parse command")
@@ -173,7 +181,7 @@ export const BashTool = Tool.define("bash", async () => {
         shell,
         cwd,
         env: {
-          ...process.env,
+          ...filterSensitiveEnv(process.env),
           ...shellEnv.env,
         },
         stdio: ["ignore", "pipe", "pipe"],

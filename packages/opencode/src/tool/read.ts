@@ -1,4 +1,5 @@
 import z from "zod"
+import { isBlockedPath, getBlockedPathError } from "../security/path-filter"
 import { createReadStream } from "fs"
 import * as fs from "fs/promises"
 import * as path from "path"
@@ -34,6 +35,12 @@ export const ReadTool = Tool.define("read", {
       filepath = path.resolve(Instance.directory, filepath)
     }
     const title = path.relative(Instance.worktree, filepath)
+
+    // Security: Block access to opencode internal paths
+    if (isBlockedPath(filepath)) {
+      throw new Error(getBlockedPathError(filepath))
+    }
+
 
     const stat = Filesystem.stat(filepath)
 
