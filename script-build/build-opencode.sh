@@ -158,11 +158,22 @@ build_packages() {
         log_error "Failed to cd to packages/opencode"
         return 1
     }
-    OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod GH_REPO="${repo}" bun run script/build.ts || {
-        log_error "Failed to build packages/opencode"
-        log_info "Build log may contain more details"
-        return 1
-    }
+    
+    # Build with environment variables - only set GH_REPO if repo is not empty
+    if [[ -n "${repo}" ]]; then
+        OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod GH_REPO="${repo}" bun run script/build.ts || {
+            log_error "Failed to build packages/opencode"
+            log_info "Build log may contain more details"
+            return 1
+        }
+    else
+        OPENCODE_VERSION="${version}" OPENCODE_RELEASE=true OPENCODE_CHANNEL=prod bun run script/build.ts || {
+            log_error "Failed to build packages/opencode"
+            log_info "Build log may contain more details"
+            return 1
+        }
+    fi
+    
     # Build packages/app
     log_info "Building packages/app..."
     cd "${repo_root}/packages/app" || {
