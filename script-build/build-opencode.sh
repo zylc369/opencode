@@ -51,6 +51,14 @@ cleanup() {
 # Trap signals for cleanup
 trap cleanup ERR EXIT INT
 
+# Helper function to build gh repo argument
+# Usage: gh_repo_arg "owner/repo" returns "-R owner/repo" or empty string
+build_gh_repo_arg() {
+    local repo="$1"
+    if [[ -n "${repo}" ]]; then
+        echo "-R ${repo}"
+    fi
+}
 # Validation functions
 
 validate_version() {
@@ -230,7 +238,8 @@ check_release_exists() {
         version="v${version}"
     fi
     
-    local repo_arg="${repo:+-R }${repo}"
+    local repo_arg
+    repo_arg=$(build_gh_repo_arg "${repo}")
     if gh ${repo_arg} release view "${version}" &> /dev/null; then
         log_error "Release ${version} already exists\nPlease use a different version or delete the existing release first with: gh release delete ${version} --yes"
         return 1
@@ -251,7 +260,8 @@ create_empty_release() {
     # Set release title
     release_title="OpenCode ${version}"
     
-    local repo_arg="${repo:+-R }${repo}"
+    local repo_arg
+    repo_arg=$(build_gh_repo_arg "${repo}")
     # Create release without files
     log_info "Creating empty release ${version} with title '${release_title}'..."
     if ! gh ${repo_arg} release create "${version}" \
@@ -303,7 +313,8 @@ create_release() {
     # Set release title
     release_title="OpenCode ${version}"
     
-    local repo_arg="${repo:+-R }${repo}"
+    local repo_arg
+    repo_arg=$(build_gh_repo_arg "${repo}")
     # Create release without files first
     log_info "Creating release ${version} with title '${release_title}'..."
     if ! gh ${repo_arg} release create "${version}" \
@@ -324,7 +335,6 @@ create_release() {
         log_error "Failed to upload files to release ${version}"
         return 1
     fi
-    
     log_info "Release ${version} created and files uploaded successfully"
     return 0
 }
@@ -332,7 +342,8 @@ create_release() {
 verify_release() {
     local version="$1"
     local repo="$2"
-    local expected_assets=13  # 12 package files (7 tar.gz + 5 zip) + 1 checksums.txt
+    # 11 binary packages (6 tar.gz + 5 zip) + 1 opencode-web.tar.gz + 1 checksums.txt
+    local expected_assets=13
     
     # Ensure version has 'v' prefix
     if [[ ! "${version}" =~ ^v ]]; then
@@ -341,10 +352,15 @@ verify_release() {
     
     log_info "Verifying release ${version}..."
     
-    local repo_arg="${repo:+-R }${repo}"
+    # Build repo_arg - handle empty repo case properly
+    local repo_arg=""
+    if [[ -n "${repo}" ]]; then
+        repo_arg="-R ${repo}"
+    fi
+    
     # Check if release exists
     if ! gh ${repo_arg} release view "${version}" &> /dev/null; then
-        log_error "Release ${version} does not exist after creation"
+        log_error "Release ${version} does not exist"
         return 1
     fi
     
@@ -473,14 +489,35 @@ main() {
     build_packages "${version}" "${repo}"
 
     # Upload additional files (opencode-web and checksums)
+    # Note: build.ts already uploaded the binary packages, we only upload what's missing
     log_info "Uploading additional files to release..."
     local intermediate_dir="${SCRIPT_DIR}/intermediate"
-    local repo_arg="${repo:+-R }${repo}"
-    if ! gh ${repo_arg} release upload "v${version}" \
-        --clobber \
-        "${intermediate_dir}"/*.tar.gz \
-        "${intermediate_dir}"/*.zip \
-        "${intermediate_dir}/checksums.txt" 2>/dev/null; then
+    
+    # Build repo_arg - handle empty repo case
+    local repo_arg=""
+    if [[ -n "${repo}" ]]; then
+        repo_arg="-R ${repo}"
+    fi
+    
+    # Upload opencode-web.tar.gz and checksums.txt (binaries already uploaded by build.ts)
+    local files_to_upload=()
+    if [[ -f "${intermediate_dir}/opencode-web.tar.gz" ]]; then
+        files_to_upload+=("${intermediate_dir}/opencode-web.tar.gz")
+    fi
+    if [[ -f "${intermediate_dir}/checksums.txt" ]]; then
+        files_to_upload+=("${intermediate_dir}/checksums.txt")
+    fi
+    
+    if [[ ${#files_to_upload[@]} -gt 0 ]]; then
+        log_info "Uploading: ${files_to_upload[*]}"
+        if ! gh ${repo_arg} release upload "v${version}" \
+            --clobber \
+            "${files_to_upload[@]}"; then
+            log_error "Failed to upload additional files to release"
+            return 1
+        fi
+        log_info "Additional files uploaded successfully"
+    else
         log_info "No additional files to upload"
     fi
 
