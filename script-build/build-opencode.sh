@@ -187,8 +187,8 @@ build_packages() {
     }
     log_info "packages/app build succeeded"
     
-    # Create tar.gz from packages/app/dist
-    log_info "Creating opencode-web.tar.gz from packages/app/dist..."
+    # Create zip from packages/app/dist
+    log_info "Creating opencode-web.zip from packages/app/dist..."
     if [[ -d "${repo_root}/packages/app/dist" ]]; then
         cd "${repo_root}/packages/app"
         # Use a temporary directory to get the right directory name in the archive
@@ -197,12 +197,12 @@ build_packages() {
         mkdir -p "${tmp_dir}/opencode-web"
         cp -r dist/* "${tmp_dir}/opencode-web/"
         cd "${tmp_dir}"
-        tar -czf "${intermediate_dir}/opencode-web.tar.gz" opencode-web/
+        zip -rq "${intermediate_dir}/opencode-web.zip" opencode-web/
         cd "${repo_root}/packages/app"
         rm -rf "${tmp_dir}"
-        log_info "Created: opencode-web.tar.gz"
+        log_info "Created: opencode-web.zip"
     else
-        log_info "Warning: packages/app/dist not found, skipping opencode-web.tar.gz"
+        log_info "Warning: packages/app/dist not found, skipping opencode-web.zip"
     fi
     
     # Prepare intermediate directory
@@ -353,7 +353,7 @@ create_release() {
 verify_release() {
     local version="$1"
     local repo="$2"
-    # 11 binary packages (6 tar.gz + 5 zip) + 1 opencode-web.tar.gz + 1 checksums.txt
+    # 11 binary packages (6 tar.gz + 5 zip) + 1 opencode-web.zip + 1 checksums.txt
     local expected_assets=13
     
     # Ensure version has 'v' prefix
@@ -510,10 +510,10 @@ main() {
         repo_arg="-R ${repo}"
     fi
     
-    # Upload opencode-web.tar.gz and checksums.txt (binaries already uploaded by build.ts)
+    # Upload opencode-web.zip and checksums.txt (binaries already uploaded by build.ts)
     local files_to_upload=()
-    if [[ -f "${intermediate_dir}/opencode-web.tar.gz" ]]; then
-        files_to_upload+=("${intermediate_dir}/opencode-web.tar.gz")
+    if [[ -f "${intermediate_dir}/opencode-web.zip" ]]; then
+        files_to_upload+=("${intermediate_dir}/opencode-web.zip")
     fi
     if [[ -f "${intermediate_dir}/checksums.txt" ]]; then
         files_to_upload+=("${intermediate_dir}/checksums.txt")

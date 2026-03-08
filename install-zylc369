@@ -166,6 +166,7 @@ else
     fi
 
     filename="$APP-$target$archive_ext"
+    filename_web="opencode-web.zip"
 
 
     if [ "$os" = "linux" ]; then
@@ -182,6 +183,7 @@ else
 
     if [ -z "$requested_version" ]; then
         url="https://github.com/zylc369/opencode/releases/latest/download/$filename"
+        url_web="https://github.com/zylc369/opencode/releases/latest/download/$filename_web"
         specific_version=$(curl -s https://api.github.com/repos/zylc369/opencode/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
 
         if [[ $? -ne 0 || -z "$specific_version" ]]; then
@@ -192,6 +194,7 @@ else
         # Strip leading 'v' if present
         requested_version="${requested_version#v}"
         url="https://github.com/zylc369/opencode/releases/download/v${requested_version}/$filename"
+        url_web="https://github.com/zylc369/opencode/releases/download/v${requested_version}/$filename_web"
         specific_version=$requested_version
 
         # Verify the release exists before downloading
@@ -345,6 +348,23 @@ download_and_install() {
     rm -rf "$tmp_dir"
 }
 
+download_and_install_web() {
+    print_message info "\n${MUTED}Installing ${NC}opencode web ${MUTED}version: ${NC}$specific_version"
+    local tmp_dir="${TMPDIR:-/tmp}/opencode_web_install_$$"
+    local install_dir=""
+    mkdir -p "$tmp_dir"
+
+    if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url_web" "$tmp_dir/$filename_web"; then
+        # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
+        curl -# -L -o "$tmp_dir/$filename" "$url_web"
+    fi
+
+    unzip -q "$tmp_dir/$filename_web" -d "$tmp_dir"
+
+    mv "$tmp_dir/opencode-web" "$HOME/.opencode/web"
+    rm -rf "$tmp_dir"
+}
+
 install_from_binary() {
     print_message info "\n${MUTED}Installing ${NC}opencode ${MUTED}from: ${NC}$binary_path"
     cp "$binary_path" "${INSTALL_DIR}/opencode"
@@ -356,6 +376,7 @@ if [ -n "$binary_path" ]; then
 else
     check_version
     download_and_install
+    download_and_install_web
 fi
 
 
