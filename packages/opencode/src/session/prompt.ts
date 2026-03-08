@@ -18,6 +18,8 @@ import { ProviderTransform } from "../provider/transform"
 import { SystemPrompt } from "./system"
 import { InstructionPrompt } from "./instruction"
 import { Plugin } from "../plugin"
+import { containsBlockedPath, getBlockedCommandError, filterSensitiveEnv } from "../security/path-filter"
+
 import PROMPT_PLAN from "../session/prompt/plan.txt"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
@@ -1633,6 +1635,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const matchingInvocation = invocations[shellName] ?? invocations[""]
     const args = matchingInvocation?.args
 
+    // Security: Check for blocked commands
+    if (containsBlockedPath(input.command)) {
+      throw new Error(getBlockedCommandError(input.command))
+    }
+
     const cwd = Instance.directory
     const shellEnv = await Plugin.trigger(
       "shell.env",
@@ -1644,7 +1651,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
       env: {
-        ...process.env,
+        ...filterSensitiveEnv(process.env),
         ...shellEnv.env,
         TERM: "dumb",
       },
