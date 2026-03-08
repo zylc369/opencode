@@ -356,7 +356,7 @@ download_and_install_web() {
 
     if [[ "$os" == "windows" ]] || ! [ -t 2 ] || ! download_with_progress "$url_web" "$tmp_dir/$filename_web"; then
         # Fallback to standard curl on Windows, non-TTY environments, or if custom progress fails
-        curl -# -L -o "$tmp_dir/$filename" "$url_web"
+        curl -# -L -o "$tmp_dir/$filename_web" "$url_web"
     fi
 
     unzip -q "$tmp_dir/$filename_web" -d "$tmp_dir"
