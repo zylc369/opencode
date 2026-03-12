@@ -353,8 +353,8 @@ create_release() {
 verify_release() {
     local version="$1"
     local repo="$2"
-    # 11 binary packages (6 tar.gz + 5 zip) + 1 opencode-web.zip + 1 checksums.txt
-    local expected_assets=13
+    # 12 binary packages (6 tar.gz + 6 zip) + 1 opencode-web.zip + 1 checksums.txt
+    local expected_assets=14
     
     # Ensure version has 'v' prefix
     if [[ ! "${version}" =~ ^v ]]; then
