@@ -45,6 +45,9 @@ import { fromNodeProviderChain } from "@aws-sdk/credential-providers"
 import { GoogleAuth } from "google-auth-library"
 import { ProviderTransform } from "./transform"
 import { Installation } from "../installation"
+import { ModelID, ProviderID } from "./schema"
+
+const DEFAULT_CHUNK_TIMEOUT = 120_000
 
 export namespace Provider {
   const log = Log.create({ service: "provider" })
@@ -65,7 +68,11 @@ export namespace Provider {
     const project =
       options["project"] ?? Env.get("GOOGLE_CLOUD_PROJECT") ?? Env.get("GCP_PROJECT") ?? Env.get("GCLOUD_PROJECT")
     const location =
-      options["location"] ?? Env.get("GOOGLE_CLOUD_LOCATION") ?? Env.get("VERTEX_LOCATION") ?? "us-central1"
+      options["location"] ??
+      Env.get("GOOGLE_VERTEX_LOCATION") ??
+      Env.get("GOOGLE_CLOUD_LOCATION") ??
+      Env.get("VERTEX_LOCATION") ??
+      "us-central1"
     const endpoint = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`
 
     return {
@@ -82,6 +89,54 @@ export namespace Provider {
     return raw.replace(/\$\{([^}]+)\}/g, (match, key) => {
       const val = Env.get(String(key)) ?? vars?.[String(key) as keyof typeof vars]
       return val ?? match
+    })
+  }
+
+  function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+    if (typeof ms !== "number" || ms <= 0) return res
+    if (!res.body) return res
+    if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
+
+    const reader = res.body.getReader()
+    const body = new ReadableStream<Uint8Array>({
+      async pull(ctrl) {
+        const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+          const id = setTimeout(() => {
+            const err = new Error("SSE read timed out")
+            ctl.abort(err)
+            void reader.cancel(err)
+            reject(err)
+          }, ms)
+
+          reader.read().then(
+            (part) => {
+              clearTimeout(id)
+              resolve(part)
+            },
+            (err) => {
+              clearTimeout(id)
+              reject(err)
+            },
+          )
+        })
+
+        if (part.done) {
+          ctrl.close()
+          return
+        }
+
+        ctrl.enqueue(part.value)
+      },
+      async cancel(reason) {
+        ctl.abort(reason)
+        await reader.cancel(reason)
+      },
+    })
+
+    return new Response(body, {
+      headers: new Headers(res.headers),
+      status: res.status,
+      statusText: res.statusText,
     })
   }
 
@@ -387,7 +442,11 @@ export namespace Provider {
         Env.get("GCLOUD_PROJECT")
 
       const location =
-        provider.options?.location ?? Env.get("GOOGLE_CLOUD_LOCATION") ?? Env.get("VERTEX_LOCATION") ?? "us-central1"
+        provider.options?.location ??
+        Env.get("GOOGLE_VERTEX_LOCATION") ??
+        Env.get("GOOGLE_CLOUD_LOCATION") ??
+        Env.get("VERTEX_LOCATION") ??
+        "us-central1"
 
       const autoload = Boolean(project)
       if (!autoload) return { autoload: false }
@@ -480,6 +539,7 @@ export namespace Provider {
 
       const aiGatewayHeaders = {
         "User-Agent": `opencode/${Installation.VERSION} gitlab-ai-provider/${GITLAB_PROVIDER_VERSION} (${os.platform()} ${os.release()}; ${os.arch()})`,
+        "anthropic-beta": "context-1m-2025-08-07",
         ...(providerConfig?.options?.aiGatewayHeaders || {}),
       }
 
@@ -614,8 +674,8 @@ export namespace Provider {
 
   export const Model = z
     .object({
-      id: z.string(),
-      providerID: z.string(),
+      id: ModelID.zod,
+      providerID: ProviderID.zod,
       api: z.object({
         id: z.string(),
         url: z.string(),
@@ -685,7 +745,7 @@ export namespace Provider {
 
   export const Info = z
     .object({
-      id: z.string(),
+      id: ProviderID.zod,
       name: z.string(),
       source: z.enum(["env", "config", "custom", "api"]),
       env: z.string().array(),
@@ -700,8 +760,8 @@ export namespace Provider {
 
   function fromModelsDevModel(provider: ModelsDev.Provider, model: ModelsDev.Model): Model {
     const m: Model = {
-      id: model.id,
-      providerID: provider.id,
+      id: ModelID.make(model.id),
+      providerID: ProviderID.make(provider.id),
       name: model.name,
       family: model.family,
       api: {
@@ -767,7 +827,7 @@ export namespace Provider {
 
   export function fromModelsDevProvider(provider: ModelsDev.Provider): Info {
     return {
-      id: provider.id,
+      id: ProviderID.make(provider.id),
       source: "custom",
       name: provider.name,
       env: provider.env ?? [],
@@ -785,7 +845,7 @@ export namespace Provider {
     const disabled = new Set(config.disabled_providers ?? [])
     const enabled = config.enabled_providers ? new Set(config.enabled_providers) : null
 
-    function isProviderAllowed(providerID: string): boolean {
+    function isProviderAllowed(providerID: ProviderID): boolean {
       if (enabled && !enabled.has(providerID)) return false
       if (disabled.has(providerID)) return false
       return true
@@ -807,16 +867,16 @@ export namespace Provider {
       const githubCopilot = database["github-copilot"]
       database["github-copilot-enterprise"] = {
         ...githubCopilot,
-        id: "github-copilot-enterprise",
+        id: ProviderID.githubCopilotEnterprise,
         name: "GitHub Copilot Enterprise",
         models: mapValues(githubCopilot.models, (model) => ({
           ...model,
-          providerID: "github-copilot-enterprise",
+          providerID: ProviderID.githubCopilotEnterprise,
         })),
       }
     }
 
-    function mergeProvider(providerID: string, provider: Partial<Info>) {
+    function mergeProvider(providerID: ProviderID, provider: Partial<Info>) {
       const existing = providers[providerID]
       if (existing) {
         // @ts-expect-error
@@ -833,7 +893,7 @@ export namespace Provider {
     for (const [providerID, provider] of configProviders) {
       const existing = database[providerID]
       const parsed: Info = {
-        id: providerID,
+        id: ProviderID.make(providerID),
         name: provider.name ?? existing?.name ?? providerID,
         env: provider.env ?? existing?.env ?? [],
         options: mergeDeep(existing?.options ?? {}, provider.options ?? {}),
@@ -849,7 +909,7 @@ export namespace Provider {
           return existingModel?.name ?? modelID
         })
         const parsedModel: Model = {
-          id: modelID,
+          id: ModelID.make(modelID),
           api: {
             id: model.id ?? existingModel?.api.id ?? modelID,
             npm:
@@ -862,7 +922,7 @@ export namespace Provider {
           },
           status: model.status ?? existingModel?.status ?? "active",
           name,
-          providerID,
+          providerID: ProviderID.make(providerID),
           capabilities: {
             temperature: model.temperature ?? existingModel?.capabilities.temperature ?? false,
             reasoning: model.reasoning ?? existingModel?.capabilities.reasoning ?? false,
@@ -914,7 +974,8 @@ export namespace Provider {
 
     // load env
     const env = Env.all()
-    for (const [providerID, provider] of Object.entries(database)) {
+    for (const [id, provider] of Object.entries(database)) {
+      const providerID = ProviderID.make(id)
       if (disabled.has(providerID)) continue
       const apiKey = provider.env.map((item) => env[item]).find(Boolean)
       if (!apiKey) continue
@@ -925,7 +986,8 @@ export namespace Provider {
     }
 
     // load apikeys
-    for (const [providerID, provider] of Object.entries(await Auth.all())) {
+    for (const [id, provider] of Object.entries(await Auth.all())) {
+      const providerID = ProviderID.make(id)
       if (disabled.has(providerID)) continue
       if (provider.type === "api") {
         mergeProvider(providerID, {
@@ -937,7 +999,7 @@ export namespace Provider {
 
     for (const plugin of await Plugin.list()) {
       if (!plugin.auth) continue
-      const providerID = plugin.auth.provider
+      const providerID = ProviderID.make(plugin.auth.provider)
       if (disabled.has(providerID)) continue
 
       // For github-copilot plugin, check if auth exists for either github-copilot or github-copilot-enterprise
@@ -946,7 +1008,7 @@ export namespace Provider {
       if (auth) hasAuth = true
 
       // Special handling for github-copilot: also check for enterprise auth
-      if (providerID === "github-copilot" && !hasAuth) {
+      if (providerID === ProviderID.githubCopilot && !hasAuth) {
         const enterpriseAuth = await Auth.get("github-copilot-enterprise")
         if (enterpriseAuth) hasAuth = true
       }
@@ -963,8 +1025,8 @@ export namespace Provider {
       }
 
       // If this is github-copilot plugin, also register for github-copilot-enterprise if auth exists
-      if (providerID === "github-copilot") {
-        const enterpriseProviderID = "github-copilot-enterprise"
+      if (providerID === ProviderID.githubCopilot) {
+        const enterpriseProviderID = ProviderID.githubCopilotEnterprise
         if (!disabled.has(enterpriseProviderID)) {
           const enterpriseAuth = await Auth.get(enterpriseProviderID)
           if (enterpriseAuth) {
@@ -982,7 +1044,8 @@ export namespace Provider {
       }
     }
 
-    for (const [providerID, fn] of Object.entries(CUSTOM_LOADERS)) {
+    for (const [id, fn] of Object.entries(CUSTOM_LOADERS)) {
+      const providerID = ProviderID.make(id)
       if (disabled.has(providerID)) continue
       const data = database[providerID]
       if (!data) {
@@ -999,7 +1062,8 @@ export namespace Provider {
     }
 
     // load config
-    for (const [providerID, provider] of configProviders) {
+    for (const [id, provider] of configProviders) {
+      const providerID = ProviderID.make(id)
       const partial: Partial<Info> = { source: "config" }
       if (provider.env) partial.env = provider.env
       if (provider.name) partial.name = provider.name
@@ -1007,7 +1071,8 @@ export namespace Provider {
       mergeProvider(providerID, partial)
     }
 
-    for (const [providerID, provider] of Object.entries(providers)) {
+    for (const [id, provider] of Object.entries(providers)) {
+      const providerID = ProviderID.make(id)
       if (!isProviderAllowed(providerID)) {
         delete providers[providerID]
         continue
@@ -1017,7 +1082,10 @@ export namespace Provider {
 
       for (const [modelID, model] of Object.entries(provider.models)) {
         model.api.id = model.api.id ?? model.id ?? modelID
-        if (modelID === "gpt-5-chat-latest" || (providerID === "openrouter" && modelID === "openai/gpt-5-chat"))
+        if (
+          modelID === "gpt-5-chat-latest" ||
+          (providerID === ProviderID.openrouter && modelID === "openai/gpt-5-chat")
+        )
           delete provider.models[modelID]
         if (model.status === "alpha" && !Flag.OPENCODE_ENABLE_EXPERIMENTAL_MODELS) delete provider.models[modelID]
         if (model.status === "deprecated") delete provider.models[modelID]
@@ -1091,21 +1159,23 @@ export namespace Provider {
       if (existing) return existing
 
       const customFetch = options["fetch"]
+      const chunkTimeout = options["chunkTimeout"] || DEFAULT_CHUNK_TIMEOUT
+      delete options["chunkTimeout"]
 
       options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
         // Preserve custom fetch if it exists, wrap it with timeout logic
         const fetchFn = customFetch ?? fetch
         const opts = init ?? {}
+        const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
+        const signals: AbortSignal[] = []
 
-        if (options["timeout"] !== undefined && options["timeout"] !== null) {
-          const signals: AbortSignal[] = []
-          if (opts.signal) signals.push(opts.signal)
-          if (options["timeout"] !== false) signals.push(AbortSignal.timeout(options["timeout"]))
+        if (opts.signal) signals.push(opts.signal)
+        if (chunkAbortCtl) signals.push(chunkAbortCtl.signal)
+        if (options["timeout"] !== undefined && options["timeout"] !== null && options["timeout"] !== false)
+          signals.push(AbortSignal.timeout(options["timeout"]))
 
-          const combined = signals.length > 1 ? AbortSignal.any(signals) : signals[0]
-
-          opts.signal = combined
-        }
+        const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
+        if (combined) opts.signal = combined
 
         // Strip openai itemId metadata following what codex does
         // Codex uses #[serde(skip_serializing)] on id fields for all item types:
@@ -1125,11 +1195,14 @@ export namespace Provider {
           }
         }
 
-        return fetchFn(input, {
+        const res = await fetchFn(input, {
           ...opts,
           // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
           timeout: false,
         })
+
+        if (!chunkAbortCtl) return res
+        return wrapSSE(res, chunkTimeout, chunkAbortCtl)
       }
 
       const bundledFn = BUNDLED_PROVIDERS[model.api.npm]
@@ -1165,11 +1238,11 @@ export namespace Provider {
     }
   }
 
-  export async function getProvider(providerID: string) {
+  export async function getProvider(providerID: ProviderID) {
     return state().then((s) => s.providers[providerID])
   }
 
-  export async function getModel(providerID: string, modelID: string) {
+  export async function getModel(providerID: ProviderID, modelID: ModelID) {
     const s = await state()
     const provider = s.providers[providerID]
     if (!provider) {
@@ -1216,7 +1289,7 @@ export namespace Provider {
     }
   }
 
-  export async function closest(providerID: string, query: string[]) {
+  export async function closest(providerID: ProviderID, query: string[]) {
     const s = await state()
     const provider = s.providers[providerID]
     if (!provider) return undefined
@@ -1231,7 +1304,7 @@ export namespace Provider {
     }
   }
 
-  export async function getSmallModel(providerID: string) {
+  export async function getSmallModel(providerID: ProviderID) {
     const cfg = await Config.get()
 
     if (cfg.small_model) {
@@ -1258,7 +1331,7 @@ export namespace Provider {
         priority = ["gpt-5-mini", "claude-haiku-4.5", ...priority]
       }
       for (const item of priority) {
-        if (providerID === "amazon-bedrock") {
+        if (providerID === ProviderID.amazonBedrock) {
           const crossRegionPrefixes = ["global.", "us.", "eu."]
           const candidates = Object.keys(provider.models).filter((m) => m.includes(item))
 
@@ -1267,38 +1340,32 @@ export namespace Provider {
           // 2. User's region prefix (us., eu.)
           // 3. Unprefixed model
           const globalMatch = candidates.find((m) => m.startsWith("global."))
-          if (globalMatch) return getModel(providerID, globalMatch)
+          if (globalMatch) return getModel(providerID, ModelID.make(globalMatch))
 
           const region = provider.options?.region
           if (region) {
             const regionPrefix = region.split("-")[0]
             if (regionPrefix === "us" || regionPrefix === "eu") {
               const regionalMatch = candidates.find((m) => m.startsWith(`${regionPrefix}.`))
-              if (regionalMatch) return getModel(providerID, regionalMatch)
+              if (regionalMatch) return getModel(providerID, ModelID.make(regionalMatch))
             }
           }
 
           const unprefixed = candidates.find((m) => !crossRegionPrefixes.some((p) => m.startsWith(p)))
-          if (unprefixed) return getModel(providerID, unprefixed)
+          if (unprefixed) return getModel(providerID, ModelID.make(unprefixed))
         } else {
           for (const model of Object.keys(provider.models)) {
-            if (model.includes(item)) return getModel(providerID, model)
+            if (model.includes(item)) return getModel(providerID, ModelID.make(model))
           }
         }
       }
-    }
-
-    // Check if opencode provider is available before using it
-    const opencodeProvider = await state().then((state) => state.providers["opencode"])
-    if (opencodeProvider && opencodeProvider.models["gpt-5-nano"]) {
-      return getModel("opencode", "gpt-5-nano")
     }
 
     return undefined
   }
 
   const priority = ["gpt-5", "claude-sonnet-4", "big-pickle", "gemini-3-pro"]
-  export function sort(models: Model[]) {
+  export function sort<T extends { id: string }>(models: T[]) {
     return sortBy(
       models,
       [(model) => priority.findIndex((filter) => model.id.includes(filter)), "desc"],
@@ -1312,11 +1379,11 @@ export namespace Provider {
     if (cfg.model) return parseModel(cfg.model)
 
     const providers = await list()
-    const recent = (await Filesystem.readJson<{ recent?: { providerID: string; modelID: string }[] }>(
+    const recent = (await Filesystem.readJson<{ recent?: { providerID: ProviderID; modelID: ModelID }[] }>(
       path.join(Global.Path.state, "model.json"),
     )
       .then((x) => (Array.isArray(x.recent) ? x.recent : []))
-      .catch(() => [])) as { providerID: string; modelID: string }[]
+      .catch(() => [])) as { providerID: ProviderID; modelID: ModelID }[]
     for (const entry of recent) {
       const provider = providers[entry.providerID]
       if (!provider) continue
@@ -1337,16 +1404,16 @@ export namespace Provider {
   export function parseModel(model: string) {
     const [providerID, ...rest] = model.split("/")
     return {
-      providerID: providerID,
-      modelID: rest.join("/"),
+      providerID: ProviderID.make(providerID),
+      modelID: ModelID.make(rest.join("/")),
     }
   }
 
   export const ModelNotFoundError = NamedError.create(
     "ProviderModelNotFoundError",
     z.object({
-      providerID: z.string(),
-      modelID: z.string(),
+      providerID: ProviderID.zod,
+      modelID: ModelID.zod,
       suggestions: z.array(z.string()).optional(),
     }),
   )
@@ -1354,7 +1421,7 @@ export namespace Provider {
   export const InitError = NamedError.create(
     "ProviderInitError",
     z.object({
-      providerID: z.string(),
+      providerID: ProviderID.zod,
     }),
   )
 }
