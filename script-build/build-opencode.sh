@@ -141,6 +141,21 @@ detect_git_repo() {
     return 0
 }
 
+install_dependencies() {
+    local repo_root="${SCRIPT_DIR}/.."
+    
+    log_info "Upgrading bun to latest version..."
+    bun upgrade || return 1
+    
+    log_info "Installing dependencies in project root..."
+    (cd "${repo_root}" && bun i) || return 1
+    
+    log_info "Installing dependencies in packages/opencode..."
+    (cd "${repo_root}/packages/opencode" && bun i) || return 1
+    
+    log_info "Dependencies installed successfully"
+}
+
 build_packages() {
     local version="$1"
     local repo="$2"
@@ -495,6 +510,8 @@ main() {
     log_info "Creating empty release..."
     check_release_exists "${version}" "${repo}"
     create_empty_release "${version}" "${repo}"
+
+    install_dependencies
 
     # Build packages (TypeScript script will upload files now)
     build_packages "${version}" "${repo}"
