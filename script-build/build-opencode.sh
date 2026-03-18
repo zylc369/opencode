@@ -4,10 +4,11 @@
 #
 # Build script for the opencode package
 #
-# Usage: ./script-build/build-opencode.sh <VERSION> [options]
+# Usage: ./script-build/build-opencode.sh [VERSION] [options]
 #
 # Arguments:
 #   VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)
+#              If not provided, reads from packages/opencode/package.json and appends .1
 #
 # Options:
 #   --validate  Dry-run mode - only run validations, no release
@@ -453,9 +454,10 @@ main() {
                 shift
                 ;;
             -h|--help)
-                echo "Usage: $0 <VERSION> [--repo REPO] [options]"
+                echo "Usage: $0 [VERSION] [--repo REPO] [options]"
                 echo ""
                 echo "  VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)"
+                echo "             If not provided, reads from packages/opencode/package.json and appends .1"
                 echo ""
                 echo "Options:"
                 echo "  --repo REPO    Target repository (e.g., owner/repo, defaults to git remote if not specified)"
@@ -477,11 +479,20 @@ main() {
         esac
     done
 
-    # Check version argument
     if [[ -z "${version}" ]]; then
-        echo "Usage: $0 <VERSION> [--repo REPO] [--validate]" >&2
-        echo "Run '$0 --help' for more information" >&2
-        log_error "No version provided"
+        local package_json="${SCRIPT_DIR}/../packages/opencode/package.json"
+        if [[ ! -f "${package_json}" ]]; then
+            log_error "package.json not found at ${package_json}"
+        fi
+        
+        local base_version
+        base_version=$(jq -r '.version' "${package_json}" 2>/dev/null)
+        if [[ -z "${base_version}" || "${base_version}" == "null" ]]; then
+            log_error "Failed to read version from ${package_json}"
+        fi
+        
+        version="${base_version}.1"
+        log_info "Auto-generated version from package.json: ${version}"
     fi
 
     # Run validations
