@@ -43,12 +43,13 @@ import { fn } from "@/util/fn"
 import { SessionProcessor } from "./processor"
 import { TaskTool } from "@/tool/task"
 import { Tool } from "@/tool/tool"
-import { PermissionNext } from "@/permission/next"
+import { PermissionNext } from "@/permission"
 import { SessionStatus } from "./status"
 import { LLM } from "./llm"
 import { iife } from "@/util/iife"
 import { Shell } from "@/shell/shell"
-import { Truncate } from "@/tool/truncation"
+import { Truncate } from "@/tool/truncate"
+import { decodeDataUrl } from "@/util/data-url"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -441,14 +442,14 @@ export namespace SessionPrompt {
           extra: { bypassAgentCheck: true },
           messages: msgs,
           async metadata(input) {
-            await Session.updatePart({
+            part = (await Session.updatePart({
               ...part,
               type: "tool",
               state: {
                 ...part.state,
                 ...input,
               },
-            } satisfies MessageV2.ToolPart)
+            } satisfies MessageV2.ToolPart)) as MessageV2.ToolPart
           },
           async ask(req) {
             await PermissionNext.ask({
@@ -509,7 +510,7 @@ export namespace SessionPrompt {
                 start: part.state.status === "running" ? part.state.time.start : Date.now(),
                 end: Date.now(),
               },
-              metadata: part.metadata,
+              metadata: "metadata" in part.state ? part.state.metadata : undefined,
               input: part.state.input,
             },
           } satisfies MessageV2.ToolPart)
@@ -681,6 +682,7 @@ export namespace SessionPrompt {
       const result = await processor.process({
         user: lastUser,
         agent,
+        permission: session.permission,
         abort,
         sessionID,
         system,
@@ -1095,7 +1097,7 @@ export namespace SessionPrompt {
                     sessionID: input.sessionID,
                     type: "text",
                     synthetic: true,
-                    text: Buffer.from(part.url, "base64url").toString(),
+                    text: decodeDataUrl(part.url),
                   },
                   {
                     ...part,
@@ -1259,7 +1261,7 @@ export namespace SessionPrompt {
                 ]
               }
 
-              FileTime.read(input.sessionID, filepath)
+              await FileTime.read(input.sessionID, filepath)
               return [
                 {
                   messageID: info.id,
@@ -1331,6 +1333,31 @@ export namespace SessionPrompt {
         parts,
       },
     )
+
+    const parsedInfo = MessageV2.Info.safeParse(info)
+    if (!parsedInfo.success) {
+      log.error("invalid user message before save", {
+        sessionID: input.sessionID,
+        messageID: info.id,
+        agent: info.agent,
+        model: info.model,
+        issues: parsedInfo.error.issues,
+      })
+    }
+
+    parts.forEach((part, index) => {
+      const parsedPart = MessageV2.Part.safeParse(part)
+      if (parsedPart.success) return
+      log.error("invalid user part before save", {
+        sessionID: input.sessionID,
+        messageID: info.id,
+        partID: part.id,
+        partType: part.type,
+        index,
+        issues: parsedPart.error.issues,
+        part,
+      })
+    })
 
     await Session.updateMessage(info)
     for (const part of parts) {
