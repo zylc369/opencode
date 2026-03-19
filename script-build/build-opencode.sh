@@ -8,7 +8,8 @@
 #
 # Arguments:
 #   VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)
-#              If not provided, reads from packages/opencode/package.json and appends .1
+#              If not provided, reads from packages/opencode/package.json and finds
+#              next available version (.1 through .5) by checking GitHub releases
 #
 # Options:
 #   --validate  Dry-run mode - only run validations, no release
@@ -60,6 +61,29 @@ build_gh_repo_arg() {
         echo "-R ${repo}"
     fi
 }
+find_next_version() {
+    local base_version="$1"
+    local repo="$2"
+    local repo_arg
+    repo_arg=$(build_gh_repo_arg "${repo}")
+    
+    for suffix in 1 2 3 4 5; do
+        local candidate_version="${base_version}.${suffix}"
+        local version_with_v="${candidate_version}"
+        if [[ ! "${version_with_v}" =~ ^v ]]; then
+            version_with_v="v${version_with_v}"
+        fi
+        
+        if ! gh ${repo_arg} release view "${version_with_v}" &> /dev/null; then
+            echo "${candidate_version}"
+            return 0
+        fi
+        log_info "Version ${candidate_version} already exists, trying next..." >&2
+    done
+    
+    log_error "All versions ${base_version}.1 through ${base_version}.5 already exist"
+}
+
 # Validation functions
 
 validate_version() {
@@ -457,7 +481,8 @@ main() {
                 echo "Usage: $0 [VERSION] [--repo REPO] [options]"
                 echo ""
                 echo "  VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)"
-                echo "             If not provided, reads from packages/opencode/package.json and appends .1"
+                echo "             If not provided, reads from packages/opencode/package.json and finds"
+                echo "             next available version (.1, .2, .3, .4, or .5) by checking GitHub releases"
                 echo ""
                 echo "Options:"
                 echo "  --repo REPO    Target repository (e.g., owner/repo, defaults to git remote if not specified)"
@@ -479,6 +504,18 @@ main() {
         esac
     done
 
+    check_gh_cli
+    check_gh_auth
+
+    if [[ -z "${repo}" ]]; then
+        repo=$(detect_git_repo)
+        if [[ -n "${repo}" ]]; then
+            log_info "Auto-detected repository: ${repo}"
+        else
+            log_info "Using gh CLI default repository"
+        fi
+    fi
+
     if [[ -z "${version}" ]]; then
         local package_json="${SCRIPT_DIR}/../packages/opencode/package.json"
         if [[ ! -f "${package_json}" ]]; then
@@ -491,30 +528,18 @@ main() {
             log_error "Failed to read version from ${package_json}"
         fi
         
-        version="${base_version}.1"
+        version=$(find_next_version "${base_version}" "${repo}")
         log_info "Auto-generated version from package.json: ${version}"
     fi
 
-    # Run validations
     log_info "Starting validation..."
     validate_version "${version}"
-    check_gh_cli
-    check_gh_auth
     log_info "All validations passed"
 
     # If validate_only mode, exit early
     if [[ "${validate_only}" == true ]]; then
         log_info "Validation complete (dry-run mode)"
         exit 0
-    fi
-    # Detect git repository if --repo not provided
-    if [[ -z "${repo}" ]]; then
-        repo=$(detect_git_repo)
-        if [[ -n "${repo}" ]]; then
-            log_info "Auto-detected repository: ${repo}"
-        else
-            log_info "Using gh CLI default repository"
-        fi
     fi
 
     # Create empty release first (before build, so TypeScript script can upload)
