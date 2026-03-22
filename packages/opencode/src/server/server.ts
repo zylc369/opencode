@@ -98,6 +98,18 @@ export namespace Server {
         // Allow CORS preflight requests to succeed without auth.
         // Browser clients sending Authorization headers will preflight with OPTIONS.
         if (c.req.method === "OPTIONS") return next()
+
+        // Public paths that don't require authentication
+        // PWA resources and static assets are fetched by browser without auth headers
+        const publicPaths = [
+          "/site.webmanifest",
+          "/favicon",
+          "/apple-touch-icon",
+          "/web-app-manifest-",
+          "/social-share.png",
+        ]
+        if (publicPaths.some((p) => c.req.path.startsWith(p))) return next()
+
         const password = Flag.OPENCODE_SERVER_PASSWORD
         if (!password) return next()
         const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
