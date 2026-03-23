@@ -7,9 +7,10 @@
 # Usage: ./script-build/build-opencode.sh [VERSION] [options]
 #
 # Arguments:
-#   VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)
-#              If not provided, reads from packages/opencode/package.json and finds
-#              next available version (.1 through .5) by checking GitHub releases
+#   VERSION    Release version (e.g., v1.2.16, 1.2.16)
+#              If not provided, reads from packages/opencode/package.json and
+#              calculates fork version using: patch + 100000 + (build_count * 1000)
+#              Example: official 1.3.99 -> fork 1.3.100099, 1.3.101099, 1.3.102099...
 #
 # Options:
 #   --validate  Dry-run mode - only run validations, no release
@@ -61,27 +62,128 @@ build_gh_repo_arg() {
         echo "-R ${repo}"
     fi
 }
+
+restore_official_version() {
+    local my_version="$1"
+    local major minor patch build
+    IFS='.' read -r major minor patch build <<< "${my_version#v}"
+    
+    if [[ -n "${build}" ]]; then
+        echo "${major}.${minor}.${patch}"
+        return 0
+    fi
+    
+    if [[ ${patch} -lt 100000 ]]; then
+        echo "${major}.${minor}.${patch}"
+        return 0
+    fi
+    
+    local official_patch=$(( (patch - 100000) % 1000 ))
+    echo "${major}.${minor}.${official_patch}"
+}
+
+compute_fork_version() {
+    local official_version="$1"
+    local build_count="$2"
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "${official_version}"
+    local fork_patch=$(( 100000 + patch + (build_count * 1000) ))
+    echo "${major}.${minor}.${fork_patch}"
+}
+
+compare_versions() {
+    local v1="$1"
+    local v2="$2"
+    local major1 minor1 patch1 major2 minor2 patch2
+    IFS='.' read -r major1 minor1 patch1 <<< "${v1}"
+    IFS='.' read -r major2 minor2 patch2 <<< "${v2}"
+    
+    if [[ ${major1} -gt ${major2} ]]; then echo "gt"; return 0; fi
+    if [[ ${major1} -lt ${major2} ]]; then echo "lt"; return 0; fi
+    if [[ ${minor1} -gt ${minor2} ]]; then echo "gt"; return 0; fi
+    if [[ ${minor1} -lt ${minor2} ]]; then echo "lt"; return 0; fi
+    if [[ ${patch1} -gt ${patch2} ]]; then echo "gt"; return 0; fi
+    if [[ ${patch1} -lt ${patch2} ]]; then echo "lt"; return 0; fi
+    echo "eq"
+}
+
+get_latest_release_tag() {
+    local repo="$1"
+    local repo_arg
+    repo_arg=$(build_gh_repo_arg "${repo}")
+    local releases_json
+    releases_json=$(gh ${repo_arg} release list --limit 100 --json tagName,isDraft,isPrerelease 2>/dev/null)
+    
+    if [[ -z "${releases_json}" || "${releases_json}" == "[]" ]]; then
+        echo ""
+        return 0
+    fi
+    
+    local latest_tag
+    latest_tag=$(echo "${releases_json}" | jq -r '
+        [.[] | select(.isDraft == false and .isPrerelease == false)] |
+        [.[] | .tagName] |
+        .[]' | while read -r tag; do
+            local ver="${tag#v}"
+            local major minor patch build
+            IFS='.' read -r major minor patch build <<< "${ver}"
+            if [[ -z "${build}" ]]; then
+                build=0
+            fi
+            printf "%d.%d.%d.%d|%s\n" "${major}" "${minor}" "${patch}" "${build}" "${tag}"
+        done | sort -t'|' -k1 -Vr | head -1 | cut -d'|' -f2)
+    
+    if [[ -n "${latest_tag}" ]]; then
+        echo "${latest_tag}"
+    else
+        echo ""
+    fi
+}
+
 find_next_version() {
-    local base_version="$1"
+    local pkg_version="$1"
     local repo="$2"
     local repo_arg
     repo_arg=$(build_gh_repo_arg "${repo}")
     
-    for suffix in 1 2 3 4 5; do
-        local candidate_version="${base_version}.${suffix}"
-        local version_with_v="${candidate_version}"
-        if [[ ! "${version_with_v}" =~ ^v ]]; then
-            version_with_v="v${version_with_v}"
-        fi
-        
-        if ! gh ${repo_arg} release view "${version_with_v}" &> /dev/null; then
-            echo "${candidate_version}"
-            return 0
-        fi
-        log_info "Version ${candidate_version} already exists, trying next..." >&2
-    done
+    local latest_tag
+    latest_tag=$(get_latest_release_tag "${repo}")
     
-    log_error "All versions ${base_version}.1 through ${base_version}.5 already exist"
+    if [[ -z "${latest_tag}" ]]; then
+        log_info "No existing releases found, creating first release based on package.json version"
+        compute_fork_version "${pkg_version}" 0
+        return 0
+    fi
+    
+    local latest_version="${latest_tag#v}"
+    local restored_official
+    restored_official=$(restore_official_version "${latest_version}")
+    
+    log_info "Latest release: ${latest_version} -> restored official: ${restored_official}"
+    log_info "Package.json version: ${pkg_version}"
+    
+    local cmp
+    cmp=$(compare_versions "${pkg_version}" "${restored_official}")
+    
+    case "${cmp}" in
+        "gt")
+            log_info "Package.json version is newer, starting fresh fork version"
+            compute_fork_version "${pkg_version}" 0
+            ;;
+        "eq")
+            log_info "Versions equal, incrementing build count"
+            local latest_patch
+            IFS='.' read -r _ _ latest_patch <<< "${latest_version}"
+            local build_count=$(( (latest_patch - 100000) / 1000 ))
+            local new_build_count=$((build_count + 1))
+            compute_fork_version "${pkg_version}" ${new_build_count}
+            ;;
+        "lt")
+            log_error "Package.json version (${pkg_version}) is older than latest release restored version (${restored_official})"
+            log_error "Please update packages/opencode/package.json to a newer version"
+            return 1
+            ;;
+    esac
 }
 
 # Validation functions
@@ -478,16 +580,22 @@ main() {
                 shift
                 ;;
             -h|--help)
-                echo "Usage: $0 [VERSION] [--repo REPO] [options]"
-                echo ""
-                echo "  VERSION    Release version (e.g., v1.2.16, 1.2.16, 1.2.16.1, or 1.2.16.1-buwai)"
-                echo "             If not provided, reads from packages/opencode/package.json and finds"
-                echo "             next available version (.1, .2, .3, .4, or .5) by checking GitHub releases"
-                echo ""
-                echo "Options:"
-                echo "  --repo REPO    Target repository (e.g., owner/repo, defaults to git remote if not specified)"
-                echo "  --validate      Dry-run mode - only run validations, no release"
-                echo "  -h, --help      Show this help message"
+    echo "Usage: $0 [VERSION] [--repo REPO] [options]"
+    echo ""
+    echo "  VERSION    Release version (e.g., v1.2.16, 1.2.16)"
+    echo "             If not provided, auto-calculates fork version:"
+    echo "               1. Read latest GitHub release, restore official version"
+    echo "               2. Compare with packages/opencode/package.json version"
+    echo "               3. If equal: increment build count (thousands digit)"
+    echo "               4. If newer: start from base (patch + 100000)"
+    echo "               5. If older: error and exit"
+    echo "             Formula: patch + 100000 + (build_count * 1000)"
+    echo "             Example: official 1.3.99 -> 1.3.100099, 1.3.101099..."
+    echo ""
+    echo "Options:"
+    echo "  --repo REPO    Target repository (e.g., owner/repo, defaults to git remote)"
+    echo "  --validate     Dry-run mode - only run validations, no release"
+    echo "  -h, --help     Show this help message"
                 exit 0
                 ;;
 
