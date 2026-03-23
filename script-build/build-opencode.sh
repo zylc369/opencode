@@ -172,8 +172,13 @@ find_next_version() {
             ;;
         "eq")
             log_info "Versions equal, incrementing build count"
-            local latest_patch
-            IFS='.' read -r _ _ latest_patch <<< "${latest_version}"
+            local major minor patch build
+            IFS='.' read -r major minor patch build <<< "${latest_version}"
+            latest_patch=${patch}
+            
+            if [[ -n "${build}" ]];                latest_patch="${patch}
+            fi
+            
             local build_count=$(( (latest_patch - 100000) / 1000 ))
             local new_build_count=$((build_count + 1))
             compute_fork_version "${pkg_version}" ${new_build_count}
@@ -569,7 +574,7 @@ main() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --validate)
+            --dry-run|--validate)
                 validate_only=true
                 shift
                 ;;
@@ -594,7 +599,8 @@ main() {
     echo ""
     echo "Options:"
     echo "  --repo REPO    Target repository (e.g., owner/repo, defaults to git remote)"
-    echo "  --validate     Dry-run mode - only run validations, no release"
+    echo "  --dry-run      Dry-run mode - calculate version only, no build or release"
+    echo "  --validate     Same as --dry-run (legacy alias)"
     echo "  -h, --help     Show this help message"
                 exit 0
                 ;;
