@@ -31,7 +31,7 @@ log_info() {
     local message="$1"
     local timestamp
     timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    echo "${timestamp} [INFO] ${message}"
+    echo "${timestamp} [INFO] ${message}" >&2
 }
 
 log_error() {
@@ -174,14 +174,16 @@ find_next_version() {
             log_info "Versions equal, incrementing build count"
             local major minor patch build
             IFS='.' read -r major minor patch build <<< "${latest_version}"
-            latest_patch=${patch}
+            local latest_patch=${patch}
             
-            if [[ -n "${build}" ]];                latest_patch="${patch}
+            if [[ -n "${build}" ]]; then
+                log_info "Old 4-segment format detected, treating as first fork"
+                compute_fork_version "${pkg_version}" 0
+            else
+                local build_count=$(( (latest_patch - 100000) / 1000 ))
+                local new_build_count=$((build_count + 1))
+                compute_fork_version "${pkg_version}" ${new_build_count}
             fi
-            
-            local build_count=$(( (latest_patch - 100000) / 1000 ))
-            local new_build_count=$((build_count + 1))
-            compute_fork_version "${pkg_version}" ${new_build_count}
             ;;
         "lt")
             log_error "Package.json version (${pkg_version}) is older than latest release restored version (${restored_official})"
