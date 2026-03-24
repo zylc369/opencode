@@ -626,6 +626,7 @@ export const RunCommand = cmd({
         return args.agent
       })()
 
+      log.info(`Will check session`)
       const sessionID = await session(sdk)
       if (!sessionID) {
         log.info(`Session not found`)
