@@ -57,6 +57,7 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         const query = c.req.valid("query")
         const sessions: Session.Info[] = []
+        log.info(`query=${JSON.stringify(query)}`)
         for await (const session of Session.list({
           directory: query.directory,
           roots: query.roots,
