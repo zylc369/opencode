@@ -676,11 +676,7 @@ export const RunCommand = cmd({
         const request = new Request(input, init)
         return Server.Default().fetch(request)
       }) as typeof globalThis.fetch
-      const sdk = createOpencodeClient({ 
-        baseUrl: "http://opencode.internal", 
-        fetch: fetchFn,
-        directory: process.cwd()
-      })
+      const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })
       await execute(sdk)
     })
   },
