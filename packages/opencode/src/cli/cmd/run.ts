@@ -27,6 +27,9 @@ import { SkillTool } from "../../tool/skill"
 import { BashTool } from "../../tool/bash"
 import { TodoWriteTool } from "../../tool/todo"
 import { Locale } from "../../util/locale"
+import { Log } from "../../util/log"
+
+const log = Log.create({ service: "run" })
 
 type ToolProps<T extends Tool.Info> = {
   input: Tool.InferParameters<T>
@@ -390,6 +393,10 @@ export const RunCommand = cmd({
 
       const name = title()
       const result = await sdk.session.create({ title: name, permission: rules })
+      if (result.error) {
+        log.error("session.create failed", { error: result.error })
+        return undefined
+      }
       return result.data?.id
     }
 
