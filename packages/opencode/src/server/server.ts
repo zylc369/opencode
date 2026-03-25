@@ -81,7 +81,7 @@ export namespace Server {
         if (err instanceof NamedError) {
           let message = err instanceof Error && err.stack ? err.stack : err.toString()
           message += `|method=${c.req.method}, path=${c.req.path}, traceId=${c.res.headers.get("X-TRACE-ID")}`
-          log.error(`errMsg1=${message}`, {
+          log.error(`errMsg=${message}`, {
             error: err,
           })
 
@@ -96,9 +96,6 @@ export namespace Server {
         if (err instanceof HTTPException) return err.getResponse()
         let message = err instanceof Error && err.stack ? err.stack : err.toString()
         message += `|method=${c.req.method}, path=${c.req.path}, traceId=${c.res.headers.get("X-TRACE-ID")}`
-        log.error(`errMsg2=${message}`, {
-          error: err,
-        })
         return c.json(new NamedError.Unknown({ message }).toObject(), {
           status: 500,
         })
