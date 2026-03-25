@@ -93,17 +93,10 @@ export namespace Server {
           else status = 500
           return c.json(err.toObject(), { status })
         }
-        if (err instanceof HTTPException) {
-          let message = err instanceof Error && err.stack ? err.stack : err.toString()
-          message += `|method=${c.req.method}, path=${c.req.path}, traceId=${c.res.headers.get("X-TRACE-ID")}`
-          log.error(`errMsg2=${message}`, {
-            error: err,
-          })
-          return err.getResponse()
-        }
+        if (err instanceof HTTPException) return err.getResponse()
         let message = err instanceof Error && err.stack ? err.stack : err.toString()
         message += `|method=${c.req.method}, path=${c.req.path}, traceId=${c.res.headers.get("X-TRACE-ID")}`
-        log.error(`errMsg3=${message}`, {
+        log.error(`errMsg2=${message}`, {
           error: err,
         })
         return c.json(new NamedError.Unknown({ message }).toObject(), {
