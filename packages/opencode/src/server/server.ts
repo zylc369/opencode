@@ -79,12 +79,6 @@ export namespace Server {
           error: err,
         })
         if (err instanceof NamedError) {
-          let message = err instanceof Error && err.stack ? err.stack : err.toString()
-          message += `|method=${c.req.method}, path=${c.req.path}, traceId=${c.res.headers.get("X-TRACE-ID")}`
-          log.error(`errMsg=${message}`, {
-            error: err,
-          })
-
           let status: ContentfulStatusCode
           if (err instanceof NotFoundError) status = 404
           else if (err instanceof Provider.ModelNotFoundError) status = 400
