@@ -628,8 +628,7 @@ export const RunCommand = cmd({
 
       const sessionID = await session(sdk)
       if (!sessionID) {
-        log.info(`Session not found`)
-        UI.error("Session not found1")
+        UI.error("Session not found")
         process.exit(1)
       }
       await share(sdk, sessionID)
