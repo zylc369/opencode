@@ -9,8 +9,8 @@
 # Arguments:
 #   VERSION    Release version (e.g., v1.2.16, 1.2.16)
 #              If not provided, reads from packages/opencode/package.json and
-#              calculates fork version using: patch + 100000 + (build_count * 1000)
-#              Example: official 1.3.99 -> fork 1.3.100099, 1.3.101099, 1.3.102099...
+#              calculates fork version using: patch * 100 + 100000 + build_count
+#              Example: official 1.3.0 -> fork 1.3.100000, 1.3.100001, 1.3.100002...
 #
 # Options:
 #   --validate  Dry-run mode - only run validations, no release
@@ -71,14 +71,14 @@ find_next_version() {
     
     local major minor patch
     IFS='.' read -r major minor patch <<< "${pkg_version}"
-    local fork_patch=$(( 100000 + patch ))
+    local fork_patch=$(( patch * 100 + 100000 ))
     local fork_version="${major}.${minor}.${fork_patch}"
     
     log_info "Base fork version: ${fork_version}"
     
     while check_release_exists "${fork_version}" "${fork_repo}"; do
-        log_info "Release v${fork_version} already exists, incrementing thousands digit..."
-        fork_patch=$(( fork_patch + 1000 ))
+        log_info "Release v${fork_version} already exists, incrementing build count..."
+        fork_patch=$(( fork_patch + 1 ))
         fork_version="${major}.${minor}.${fork_patch}"
         log_info "Trying version: ${fork_version}"
     done
@@ -302,12 +302,12 @@ check_release_exists() {
     return 1
 }
 
-increment_version_thousands() {
+increment_version() {
     local version="$1"
     local major minor patch
     IFS='.' read -r major minor patch <<< "${version#v}"
-    # Add 1000 to patch (increment thousands digit)
-    local new_patch=$((patch + 1000))
+    # Increment build count by 1
+    local new_patch=$((patch + 1))
     echo "${major}.${minor}.${new_patch}"
 }
 
@@ -317,8 +317,8 @@ find_available_version() {
     local display_ver="${version#v}"
     
     while check_release_exists "${version}" "${repo}"; do
-        log_info "Release v${display_ver} already exists, incrementing thousands digit..."
-        version=$(increment_version_thousands "${version}")
+        log_info "Release v${display_ver} already exists, incrementing build count..."
+        version=$(increment_version "${version}")
         display_ver="${version#v}"
         log_info "Trying version: ${display_ver}"
     done
@@ -510,14 +510,14 @@ main() {
     echo "Usage: $0 [VERSION] [--repo REPO] [options]"
     echo ""
     echo "  VERSION    Release version (e.g., v1.2.16, 1.2.16)"
-    echo "             If not provided, auto-calculates fork version:"
-    echo "               1. Read latest GitHub release, restore official version"
-    echo "               2. Compare with packages/opencode/package.json version"
-    echo "               3. If equal: increment build count (thousands digit)"
-    echo "               4. If newer: start from base (patch + 100000)"
-    echo "               5. If older: error and exit"
-    echo "             Formula: patch + 100000 + (build_count * 1000)"
-    echo "             Example: official 1.3.99 -> 1.3.100099, 1.3.101099..."
+    echo "             If not provided, auto-calculates fork version from package.json:"
+    echo "               1. Read version from packages/opencode/package.json"
+    echo "               2. Calculate base fork version: patch * 100 + 100000"
+    echo "               3. Check if version exists on GitHub releases"
+    echo "               4. If exists, increment by 1 until finding available version"
+    echo "             Formula: patch * 100 + 100000"
+    echo "             Example: official 1.3.0 -> 1.3.100000, 1.3.100001..."
+    echo "                      official 1.3.1 -> 1.3.100100, 1.3.100101..."
     echo ""
     echo "Options:"
     echo "  --repo REPO    Target repository (e.g., owner/repo, defaults to git remote)"
