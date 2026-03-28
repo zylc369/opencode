@@ -140,54 +140,131 @@ get_latest_release_tag() {
     fi
 }
 
-find_next_version() {
-    local pkg_version="$1"
-    local repo="$2"
-    local repo_arg
-    repo_arg=$(build_gh_repo_arg "${repo}")
+# Official OpenCode repo for version comparison
+OFFICIAL_REPO="anomalyco/opencode"
+
+# Get latest release tag from official repo (returns tag like v1.3.2)
+get_official_latest_tag() {
+    local releases_json
+    releases_json=$(gh -R "${OFFICIAL_REPO}" release list --limit 100 --json tagName,isDraft,isPrerelease 2>/dev/null)
     
-    local latest_tag
-    latest_tag=$(get_latest_release_tag "${repo}")
-    
-    if [[ -z "${latest_tag}" ]]; then
-        log_info "No existing releases found, creating first release based on package.json version"
-        compute_fork_version "${pkg_version}" 0
+    if [[ -z "${releases_json}" || "${releases_json}" == "[]" ]]; then
+        echo ""
         return 0
     fi
     
-    local latest_version="${latest_tag#v}"
-    local restored_official
-    restored_official=$(restore_official_version "${latest_version}")
+    local latest_tag
+    latest_tag=$(echo "${releases_json}" | jq -r '
+        [.[] | select(.isDraft == false and .isPrerelease == false)] |
+        [.[] | .tagName] |
+        .[]' | sort -Vr | head -1)
     
-    log_info "Latest release: ${latest_version} -> restored official: ${restored_official}"
+    echo "${latest_tag}"
+}
+
+# Find latest fork release for a given official base version
+# Returns the fork tag (e.g., v1.3.101000) or empty if none exists
+find_latest_fork_for_base() {
+    local base_version="$1"
+    local fork_repo="$2"
+    
+    local repo_arg
+    repo_arg=$(build_gh_repo_arg "${fork_repo}")
+    
+    local releases_json
+    releases_json=$(gh ${repo_arg} release list --limit 100 --json tagName,isDraft,isPrerelease 2>/dev/null)
+    
+    if [[ -z "${releases_json}" || "${releases_json}" == "[]" ]]; then
+        echo ""
+        return 0
+    fi
+    
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "${base_version}"
+    local fork_patch_base=$(( 100000 + patch ))
+    
+    # Find fork releases that match this base version
+    local latest_fork_tag
+    latest_fork_tag=$(echo "${releases_json}" | jq -r '
+        [.[] | select(.isDraft == false and .isPrerelease == false)] |
+        [.[] | .tagName] |
+        .[]' | while read -r tag; do
+            local ver="${tag#v}"
+            local t_major t_minor t_patch t_build
+            IFS='.' read -r t_major t_minor t_patch t_build <<< "${ver}"
+            # Only consider fork versions (patch >= 100000) for this major.minor
+            if [[ "${t_major}" == "${major}" && "${t_minor}" == "${minor}" && "${t_patch}" -ge ${fork_patch_base} && "${t_patch}" -lt $((fork_patch_base + 1000)) ]]; then
+                printf "%d|%s\n" "${t_patch}" "${tag}"
+            fi
+        done | sort -t'|' -k1 -nr | head -1 | cut -d'|' -f2)
+    
+    echo "${latest_fork_tag}"
+}
+
+find_next_version() {
+    local pkg_version="$1"
+    local fork_repo="$2"
+    
+    local official_tag
+    official_tag=$(get_official_latest_tag)
+    
+    if [[ -z "${official_tag}" ]]; then
+        log_error "Failed to get latest release from official repo (${OFFICIAL_REPO})"
+        return 1
+    fi
+    
+    local official_version="${official_tag#v}"
+    log_info "Official repo (${OFFICIAL_REPO}) latest release: ${official_version}"
     log_info "Package.json version: ${pkg_version}"
     
     local cmp
-    cmp=$(compare_versions "${pkg_version}" "${restored_official}")
+    cmp=$(compare_versions "${pkg_version}" "${official_version}")
     
     case "${cmp}" in
         "gt")
-            log_info "Package.json version is newer, starting fresh fork version"
+            log_info "Package.json version is newer than official, starting fresh fork version"
             compute_fork_version "${pkg_version}" 0
             ;;
         "eq")
-            log_info "Versions equal, incrementing build count"
+            log_info "Package.json version matches official, finding latest fork release..."
+            local latest_fork_tag
+            latest_fork_tag=$(find_latest_fork_for_base "${pkg_version}" "${fork_repo}")
+            
+            if [[ -z "${latest_fork_tag}" ]]; then
+                log_info "No existing fork releases for this version, creating first fork"
+                compute_fork_version "${pkg_version}" 0
+                return 0
+            fi
+            
+            local fork_version="${latest_fork_tag#v}"
+            local restored_base
+            restored_base=$(restore_official_version "${fork_version}")
+            
+            log_info "Latest fork release: ${fork_version} -> base version: ${restored_base}"
+            
+            if [[ "${restored_base}" != "${pkg_version}" ]]; then
+                log_error "Fork release base (${restored_base}) doesn't match package.json (${pkg_version})"
+                log_error "Inconsistent state - please clean up releases or update package.json"
+                return 1
+            fi
+            
             local major minor patch build
-            IFS='.' read -r major minor patch build <<< "${latest_version}"
-            local latest_patch=${patch}
+            IFS='.' read -r major minor patch build <<< "${fork_version}"
             
             if [[ -n "${build}" ]]; then
                 log_info "Old 4-segment format detected, treating as first fork"
                 compute_fork_version "${pkg_version}" 0
-            else
-                local build_count=$(( (latest_patch - 100000) / 1000 ))
-                local new_build_count=$((build_count + 1))
-                compute_fork_version "${pkg_version}" ${new_build_count}
+                return 0
             fi
+            
+            local build_count=$(( (patch - 100000) / 1000 ))
+            local new_build_count=$((build_count + 1))
+            log_info "Incrementing build count: ${build_count} -> ${new_build_count}"
+            compute_fork_version "${pkg_version}" ${new_build_count}
             ;;
         "lt")
-            log_error "Package.json version (${pkg_version}) is older than latest release restored version (${restored_official})"
-            log_error "Please update packages/opencode/package.json to a newer version"
+            log_error "Package.json version (${pkg_version}) is older than official version (${official_version})"
+            log_error "Please update packages/opencode/package.json to version ${official_version} or newer"
             return 1
             ;;
     esac
