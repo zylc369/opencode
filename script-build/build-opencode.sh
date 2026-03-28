@@ -263,9 +263,10 @@ find_next_version() {
             compute_fork_version "${pkg_version}" ${new_build_count}
             ;;
         "lt")
-            log_error "Package.json version (${pkg_version}) is older than official version (${official_version})"
-            log_error "Please update packages/opencode/package.json to version ${official_version} or newer"
-            return 1
+            log_info "WARNING: Package.json version (${pkg_version}) is older than official version (${official_version})"
+            log_info "Consider updating packages/opencode/package.json to version ${official_version} or newer"
+            log_info "Proceeding with current version..."
+            compute_fork_version "${pkg_version}" 0
             ;;
     esac
 }
@@ -478,10 +479,36 @@ check_release_exists() {
     local repo_arg
     repo_arg=$(build_gh_repo_arg "${repo}")
     if gh ${repo_arg} release view "${version}" &> /dev/null; then
-        log_error "Release ${version} already exists\nPlease use a different version or delete the existing release first with: gh release delete ${version} --yes"
-        return 1
+        # Release exists - return 0 to indicate "exists"
+        return 0
     fi
-    log_info "Release ${version} does not exist (good)"
+    # Release does not exist - return 1 to indicate "does not exist"
+    return 1
+}
+
+increment_version_thousands() {
+    local version="$1"
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "${version#v}"
+    # Add 1000 to patch (increment thousands digit)
+    local new_patch=$((patch + 1000))
+    echo "${major}.${minor}.${new_patch}"
+}
+
+find_available_version() {
+    local version="$1"
+    local repo="$2"
+    local display_ver="${version#v}"
+    
+    while check_release_exists "${version}" "${repo}"; do
+        log_info "Release v${display_ver} already exists, incrementing thousands digit..."
+        version=$(increment_version_thousands "${version}")
+        display_ver="${version#v}"
+        log_info "Trying version: ${display_ver}"
+    done
+    
+    log_info "Available version found: ${display_ver}"
+    echo "${version#v}"
 }
 
 create_empty_release() {
@@ -735,9 +762,10 @@ main() {
         exit 0
     fi
 
-    # Create empty release first (before build, so TypeScript script can upload)
+    log_info "Finding available version..."
+    version=$(find_available_version "${version}" "${repo}")
+
     log_info "Creating empty release..."
-    check_release_exists "${version}" "${repo}"
     create_empty_release "${version}" "${repo}"
 
     install_dependencies
