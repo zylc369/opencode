@@ -63,212 +63,28 @@ build_gh_repo_arg() {
     fi
 }
 
-restore_official_version() {
-    local my_version="$1"
-    local major minor patch build
-    IFS='.' read -r major minor patch build <<< "${my_version#v}"
-    
-    if [[ -n "${build}" ]]; then
-        echo "${major}.${minor}.${patch}"
-        return 0
-    fi
-    
-    if [[ ${patch} -lt 100000 ]]; then
-        echo "${major}.${minor}.${patch}"
-        return 0
-    fi
-    
-    local official_patch=$(( (patch - 100000) % 1000 ))
-    echo "${major}.${minor}.${official_patch}"
-}
-
-compute_fork_version() {
-    local official_version="$1"
-    local build_count="$2"
-    local major minor patch
-    IFS='.' read -r major minor patch <<< "${official_version}"
-    local fork_patch=$(( 100000 + patch + (build_count * 1000) ))
-    echo "${major}.${minor}.${fork_patch}"
-}
-
-compare_versions() {
-    local v1="$1"
-    local v2="$2"
-    local major1 minor1 patch1 major2 minor2 patch2
-    IFS='.' read -r major1 minor1 patch1 <<< "${v1}"
-    IFS='.' read -r major2 minor2 patch2 <<< "${v2}"
-    
-    if [[ ${major1} -gt ${major2} ]]; then echo "gt"; return 0; fi
-    if [[ ${major1} -lt ${major2} ]]; then echo "lt"; return 0; fi
-    if [[ ${minor1} -gt ${minor2} ]]; then echo "gt"; return 0; fi
-    if [[ ${minor1} -lt ${minor2} ]]; then echo "lt"; return 0; fi
-    if [[ ${patch1} -gt ${patch2} ]]; then echo "gt"; return 0; fi
-    if [[ ${patch1} -lt ${patch2} ]]; then echo "lt"; return 0; fi
-    echo "eq"
-}
-
-get_latest_release_tag() {
-    local repo="$1"
-    local repo_arg
-    repo_arg=$(build_gh_repo_arg "${repo}")
-    local releases_json
-    releases_json=$(gh ${repo_arg} release list --limit 100 --json tagName,isDraft,isPrerelease 2>/dev/null)
-    
-    if [[ -z "${releases_json}" || "${releases_json}" == "[]" ]]; then
-        echo ""
-        return 0
-    fi
-    
-    local latest_tag
-    latest_tag=$(echo "${releases_json}" | jq -r '
-        [.[] | select(.isDraft == false and .isPrerelease == false)] |
-        [.[] | .tagName] |
-        .[]' | while read -r tag; do
-            local ver="${tag#v}"
-            local major minor patch build
-            IFS='.' read -r major minor patch build <<< "${ver}"
-            if [[ -z "${build}" ]]; then
-                build=0
-            fi
-            printf "%d.%d.%d.%d|%s\n" "${major}" "${minor}" "${patch}" "${build}" "${tag}"
-        done | sort -t'|' -k1 -Vr | head -1 | cut -d'|' -f2)
-    
-    if [[ -n "${latest_tag}" ]]; then
-        echo "${latest_tag}"
-    else
-        echo ""
-    fi
-}
-
-# Official OpenCode repo for version comparison
-OFFICIAL_REPO="anomalyco/opencode"
-
-# Get latest release tag from official repo (returns tag like v1.3.2)
-get_official_latest_tag() {
-    local releases_json
-    releases_json=$(gh -R "${OFFICIAL_REPO}" release list --limit 100 --json tagName,isDraft,isPrerelease 2>/dev/null)
-    
-    if [[ -z "${releases_json}" || "${releases_json}" == "[]" ]]; then
-        echo ""
-        return 0
-    fi
-    
-    local latest_tag
-    latest_tag=$(echo "${releases_json}" | jq -r '
-        [.[] | select(.isDraft == false and .isPrerelease == false)] |
-        [.[] | .tagName] |
-        .[]' | sort -Vr | head -1)
-    
-    echo "${latest_tag}"
-}
-
-# Find latest fork release for a given official base version
-# Returns the fork tag (e.g., v1.3.101000) or empty if none exists
-find_latest_fork_for_base() {
-    local base_version="$1"
-    local fork_repo="$2"
-    
-    local repo_arg
-    repo_arg=$(build_gh_repo_arg "${fork_repo}")
-    
-    local releases_json
-    releases_json=$(gh ${repo_arg} release list --limit 100 --json tagName,isDraft,isPrerelease 2>/dev/null)
-    
-    if [[ -z "${releases_json}" || "${releases_json}" == "[]" ]]; then
-        echo ""
-        return 0
-    fi
-    
-    local major minor patch
-    IFS='.' read -r major minor patch <<< "${base_version}"
-    local fork_patch_base=$(( 100000 + patch ))
-    
-    # Find fork releases that match this base version
-    local latest_fork_tag
-    latest_fork_tag=$(echo "${releases_json}" | jq -r '
-        [.[] | select(.isDraft == false and .isPrerelease == false)] |
-        [.[] | .tagName] |
-        .[]' | while read -r tag; do
-            local ver="${tag#v}"
-            local t_major t_minor t_patch t_build
-            IFS='.' read -r t_major t_minor t_patch t_build <<< "${ver}"
-            # Only consider fork versions (patch >= 100000) for this major.minor
-            if [[ "${t_major}" == "${major}" && "${t_minor}" == "${minor}" && "${t_patch}" -ge ${fork_patch_base} && "${t_patch}" -lt $((fork_patch_base + 1000)) ]]; then
-                printf "%d|%s\n" "${t_patch}" "${tag}"
-            fi
-        done | sort -t'|' -k1 -nr | head -1 | cut -d'|' -f2)
-    
-    echo "${latest_fork_tag}"
-}
-
 find_next_version() {
     local pkg_version="$1"
     local fork_repo="$2"
     
-    local official_tag
-    official_tag=$(get_official_latest_tag)
-    
-    if [[ -z "${official_tag}" ]]; then
-        log_error "Failed to get latest release from official repo (${OFFICIAL_REPO})"
-        return 1
-    fi
-    
-    local official_version="${official_tag#v}"
-    log_info "Official repo (${OFFICIAL_REPO}) latest release: ${official_version}"
     log_info "Package.json version: ${pkg_version}"
     
-    local cmp
-    cmp=$(compare_versions "${pkg_version}" "${official_version}")
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "${pkg_version}"
+    local fork_patch=$(( 100000 + patch ))
+    local fork_version="${major}.${minor}.${fork_patch}"
     
-    case "${cmp}" in
-        "gt")
-            log_info "Package.json version is newer than official, starting fresh fork version"
-            compute_fork_version "${pkg_version}" 0
-            ;;
-        "eq")
-            log_info "Package.json version matches official, finding latest fork release..."
-            local latest_fork_tag
-            latest_fork_tag=$(find_latest_fork_for_base "${pkg_version}" "${fork_repo}")
-            
-            if [[ -z "${latest_fork_tag}" ]]; then
-                log_info "No existing fork releases for this version, creating first fork"
-                compute_fork_version "${pkg_version}" 0
-                return 0
-            fi
-            
-            local fork_version="${latest_fork_tag#v}"
-            local restored_base
-            restored_base=$(restore_official_version "${fork_version}")
-            
-            log_info "Latest fork release: ${fork_version} -> base version: ${restored_base}"
-            
-            if [[ "${restored_base}" != "${pkg_version}" ]]; then
-                log_error "Fork release base (${restored_base}) doesn't match package.json (${pkg_version})"
-                log_error "Inconsistent state - please clean up releases or update package.json"
-                return 1
-            fi
-            
-            local major minor patch build
-            IFS='.' read -r major minor patch build <<< "${fork_version}"
-            
-            if [[ -n "${build}" ]]; then
-                log_info "Old 4-segment format detected, treating as first fork"
-                compute_fork_version "${pkg_version}" 0
-                return 0
-            fi
-            
-            local build_count=$(( (patch - 100000) / 1000 ))
-            local new_build_count=$((build_count + 1))
-            log_info "Incrementing build count: ${build_count} -> ${new_build_count}"
-            compute_fork_version "${pkg_version}" ${new_build_count}
-            ;;
-        "lt")
-            log_info "WARNING: Package.json version (${pkg_version}) is older than official version (${official_version})"
-            log_info "Consider updating packages/opencode/package.json to version ${official_version} or newer"
-            log_info "Proceeding with current version..."
-            compute_fork_version "${pkg_version}" 0
-            ;;
-    esac
+    log_info "Base fork version: ${fork_version}"
+    
+    while check_release_exists "${fork_version}" "${fork_repo}"; do
+        log_info "Release v${fork_version} already exists, incrementing thousands digit..."
+        fork_patch=$(( fork_patch + 1000 ))
+        fork_version="${major}.${minor}.${fork_patch}"
+        log_info "Trying version: ${fork_version}"
+    done
+    
+    log_info "Available version found: ${fork_version}"
+    echo "${fork_version}"
 }
 
 # Validation functions
