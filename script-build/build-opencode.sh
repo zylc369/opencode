@@ -141,10 +141,9 @@ detect_git_repo() {
         return 0
     fi
     
-    # Parse remote URL to extract owner/repo
-    # Remove .git suffix
     local clean_url
     clean_url="${remote_url%.git}"
+    clean_url=$(echo "${clean_url}" | sed -E 's|^(https?://)[^@]+@|\1|')
     
     # Extract owner/repo based on URL format
     if [[ "${clean_url}" =~ ^https?://github\.com/ ]]; then
@@ -232,6 +231,7 @@ build_packages() {
     
     # Create zip from packages/app/dist
     log_info "Creating opencode-web.zip from packages/app/dist..."
+    mkdir -p "${intermediate_dir}"
     if [[ -d "${repo_root}/packages/app/dist" ]]; then
         cd "${repo_root}/packages/app"
         # Use a temporary directory to get the right directory name in the archive
@@ -250,7 +250,6 @@ build_packages() {
     
     # Prepare intermediate directory
     log_info "Preparing intermediate directory..."
-    mkdir -p "${intermediate_dir}"
     cd "${intermediate_dir}"
     
     # Copy tar.gz files from packages/opencode/dist
