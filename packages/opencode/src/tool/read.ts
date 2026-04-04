@@ -10,7 +10,7 @@ import { FileTime } from "../file/time"
 import DESCRIPTION from "./read.txt"
 import { Instance } from "../project/instance"
 import { assertExternalDirectory } from "./external-directory"
-import { InstructionPrompt } from "../session/instruction"
+import { Instruction } from "../session/instruction"
 import { Filesystem } from "../util/filesystem"
 
 const DEFAULT_READ_LIMIT = 2000
@@ -33,6 +33,9 @@ export const ReadTool = Tool.define("read", {
     let filepath = params.filePath
     if (!path.isAbsolute(filepath)) {
       filepath = path.resolve(Instance.directory, filepath)
+    }
+    if (process.platform === "win32") {
+      filepath = Filesystem.normalizePath(filepath)
     }
     const title = path.relative(Instance.worktree, filepath)
 
@@ -122,7 +125,7 @@ export const ReadTool = Tool.define("read", {
       }
     }
 
-    const instructions = await InstructionPrompt.resolve(ctx.messages, filepath, ctx.messageID)
+    const instructions = await Instruction.resolve(ctx.messages, filepath, ctx.messageID)
 
     // Exclude SVG (XML-based) and vnd.fastbidsheet (.fbs extension, commonly FlatBuffers schema files)
     const mime = Filesystem.mimeType(filepath)
