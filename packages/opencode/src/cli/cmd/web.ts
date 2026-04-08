@@ -49,7 +49,7 @@ export const WebCommand = cmd({
     }
 
     const opts = await resolveNetworkOptions(args)
-    const server = Server.listen(opts)
+    const server = await Server.listen(opts)
     UI.empty()
     UI.println(UI.logo("  "))
     UI.empty()
